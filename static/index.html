@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Photo Culler</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header id="topbar">
+    <div class="left">
+      <strong>Photo Culler</strong>
+      <button id="browseBtn">📁 Choose folder…</button>
+      <span id="folderPath" class="folderpath" title="">No folder open</span>
+      <label class="chk"><input id="recursive" type="checkbox" checked /> subfolders</label>
+      <button id="reloadBtn" title="Rescan current folder">↻</button>
+    </div>
+    <div class="right">
+      <span id="counts" class="counts"></span>
+      <select id="filterSel" title="Filter (V)">
+        <option value="all">All</option>
+        <option value="keep">Keep</option>
+        <option value="reject">Reject</option>
+        <option value="unflagged">Unflagged</option>
+        <option value="rated1">★ ≥ 1</option>
+        <option value="rated3">★ ≥ 3</option>
+        <option value="rated5">★ 5</option>
+      </select>
+      <select id="typeSel" title="File type"><option value="all">All types</option></select>
+      <select id="sortSel" title="Sort by">
+        <option value="name">Filename</option>
+        <option value="taken">Date taken</option>
+        <option value="mtime">Date modified</option>
+        <option value="size">File size</option>
+        <option value="rating">Rating</option>
+      </select>
+      <button id="sortDir" title="Sort direction">↑</button>
+      <button id="mouseBtn" title="Mouse mode (B) — hotkeys act on hovered photo">🖱 Mouse</button>
+      <button id="exportBtn">Export…</button>
+      <button id="helpBtn" title="Shortcuts (V or ?)">?</button>
+    </div>
+  </header>
+
+  <main id="grid" tabindex="0"></main>
+
+  <!-- Loupe / compare overlay -->
+  <div id="viewer" class="hidden">
+    <div id="panes"></div>
+    <div id="viewerHud" class="hud"></div>
+  </div>
+
+  <!-- Help -->
+  <div id="help" class="modal hidden">
+    <div class="modal-box">
+      <h2>Shortcuts <span style="color:var(--muted);font-size:12px;font-weight:400">— left-hand, ESDF layout</span></h2>
+      <div class="cols">
+        <div>
+          <h3>Navigate</h3>
+          <ul>
+            <li><kbd>E</kbd><kbd>S</kbd><kbd>D</kbd><kbd>F</kbd> move (or arrows)</li>
+            <li><kbd>Home</kbd>/<kbd>End</kbd> first / last</li>
+            <li><kbd>G</kbd> / <kbd>Enter</kbd> loupe view</li>
+            <li><kbd>Esc</kbd> back / close</li>
+            <li><kbd>T</kbd> cycle filter</li>
+            <li><kbd>V</kbd> this help</li>
+          </ul>
+        </div>
+        <div>
+          <h3>Mark</h3>
+          <ul>
+            <li><kbd>W</kbd> keep&nbsp;&nbsp;<kbd>R</kbd> reject&nbsp;&nbsp;<kbd>Q</kbd> clear flag</li>
+            <li><kbd>1</kbd>–<kbd>5</kbd> stars&nbsp;&nbsp;<kbd>`</kbd> 0 stars</li>
+            <li>flags auto-advance to next</li>
+          </ul>
+          <h3>Compare</h3>
+          <ul>
+            <li><kbd>Space</kbd> add/remove from compare set</li>
+            <li><kbd>C</kbd> open compare (set, or current+next)</li>
+            <li><kbd>X</kbd> clear compare set</li>
+          </ul>
+        </div>
+        <div>
+          <h3>Loupe / Compare</h3>
+          <ul>
+            <li><kbd>scroll</kbd> / <kbd>E</kbd><kbd>D</kbd> zoom (synced)</li>
+            <li><kbd>drag</kbd> pan (synced in compare)</li>
+            <li><kbd>S</kbd><kbd>F</kbd> prev / next (loupe)</li>
+            <li><kbd>Z</kbd> / dblclick reset zoom</li>
+            <li>marking works here too</li>
+          </ul>
+          <h3>Mouse mode</h3>
+          <ul>
+            <li><kbd>B</kbd> toggle mouse mode</li>
+            <li>hotkeys act on the hovered photo</li>
+          </ul>
+        </div>
+      </div>
+      <button id="helpClose">Close</button>
+    </div>
+  </div>
+
+  <!-- Export -->
+  <div id="exportModal" class="modal hidden">
+    <div class="modal-box">
+      <h2>Export</h2>
+      <label>Destination folder<br/>
+        <span class="destrow">
+          <input id="exDest" type="text" placeholder="C:\path\to\output" spellcheck="false" />
+          <button id="exBrowse" type="button">📁 Browse…</button>
+        </span></label>
+      <div class="row">
+        <label>Which<br/>
+          <select id="exSel">
+            <option value="keep">Kept (P)</option>
+            <option value="reject">Rejected (X)</option>
+            <option value="rated">Rated ≥</option>
+          </select></label>
+        <label>Min ★<br/>
+          <select id="exMin"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></label>
+        <label>Action<br/>
+          <select id="exAction"><option value="copy">Copy</option><option value="move">Move</option></select></label>
+      </div>
+      <label class="chk"><input id="exStruct" type="checkbox" /> keep subfolder structure</label>
+      <div id="exStatus" class="status"></div>
+      <div class="modal-actions">
+        <button id="exCancel">Cancel</button>
+        <button id="exRun" class="primary">Export</button>
+      </div>
+
+      <div class="danger">
+        <h3>Danger zone</h3>
+        <p id="delInfo">Permanently remove all rejected (X) photos from disk.</p>
+        <button id="delRejected" class="danger-btn">🗑 Delete rejected (0)</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

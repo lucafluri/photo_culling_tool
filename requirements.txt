@@ -1,0 +1,6 @@
+fastapi>=0.103
+uvicorn[standard]>=0.23
+pillow>=9.5
+pillow-heif>=0.13
+rawpy>=0.18
+send2trash>=1.8
