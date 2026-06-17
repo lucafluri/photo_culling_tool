@@ -13,6 +13,7 @@
       <button id="browseBtn">📁 Choose folder…</button>
       <span id="folderPath" class="folderpath" title="">No folder open</span>
       <label class="chk"><input id="recursive" type="checkbox" checked /> subfolders</label>
+      <label class="chk" title="Combine same-named RAW + JPEG into one item"><input id="groupRaw" type="checkbox" checked /> group RAW+JPG</label>
       <button id="reloadBtn" title="Rescan current folder">↻</button>
     </div>
     <div class="right">
@@ -34,7 +35,11 @@
         <option value="size">File size</option>
         <option value="rating">Rating</option>
       </select>
-      <button id="sortDir" title="Sort direction">↑</button>
+      <button id="sortDir" title="Sort direction">↓</button>
+      <label class="gridsize" title="Thumbnail size">
+        <span>⊞</span>
+        <input id="gridSize" type="range" min="110" max="440" step="10" value="200" />
+      </label>
       <button id="mouseBtn" title="Mouse mode (B) — hotkeys act on hovered photo">🖱 Mouse</button>
       <button id="exportBtn">Export…</button>
       <button id="helpBtn" title="Shortcuts (V or ?)">?</button>
@@ -77,6 +82,8 @@
             <li><kbd>Space</kbd> add/remove from compare set</li>
             <li><kbd>C</kbd> open compare (set, or current+next)</li>
             <li><kbd>X</kbd> clear compare set</li>
+            <li><kbd>S</kbd><kbd>D</kbd><kbd>F</kbd> (≤3 in compare) keep that one, reject rest, close</li>
+            <li>&gt;3 selected → vote <kbd>←</kbd>/<kbd>S</kbd> vs <kbd>→</kbd>/<kbd>F</kbd> to find the best</li>
           </ul>
         </div>
         <div>
@@ -131,6 +138,25 @@
         <h3>Danger zone</h3>
         <p id="delInfo">Permanently remove all rejected (X) photos from disk.</p>
         <button id="delRejected" class="danger-btn">🗑 Delete rejected (0)</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete rejected confirmation -->
+  <div id="deleteModal" class="modal hidden">
+    <div class="modal-box wide">
+      <h2>Delete rejected photos</h2>
+      <p id="delModalInfo" class="status"></p>
+      <div class="del-actions-top">
+        <button id="delSelectAll" type="button">Select all</button>
+        <button id="delSelectNone" type="button">Deselect all</button>
+        <span id="delSelCount"></span>
+      </div>
+      <div id="delGrid" class="del-grid"></div>
+      <div id="delStatus" class="status"></div>
+      <div class="modal-actions">
+        <button id="delCancel">Cancel</button>
+        <button id="delConfirm" class="danger-btn">🗑 Delete selected</button>
       </div>
     </div>
   </div>

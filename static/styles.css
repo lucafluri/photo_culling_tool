@@ -42,6 +42,12 @@ button:hover { background: #2e2e2e; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
 button.active { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
 .chk { display: flex; align-items: center; gap: 5px; color: var(--muted); cursor: pointer; }
+.gridsize {
+  display: flex; align-items: center; gap: 6px; color: var(--muted);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  padding: 4px 9px;
+}
+.gridsize input[type=range] { width: 90px; accent-color: var(--accent); cursor: pointer; }
 .counts { color: var(--muted); margin-right: 6px; white-space: nowrap; }
 .counts b { color: var(--txt); }
 
@@ -91,6 +97,7 @@ body.mousemode .cell { cursor: crosshair; }
 }
 .typebadge.raw { background: #ff9d2e; color: #2a1600; }
 .typebadge.heic { background: #5b6bff; color: #f0f1ff; }
+.typebadge.combo { background: #2fb6a8; color: #06231f; }
 .cell .typebadge {
   position: absolute; top: 4px; left: 4px; z-index: 2;
   box-shadow: 0 1px 3px #000a; pointer-events: none;
@@ -126,6 +133,18 @@ body.mousemode .cell { cursor: crosshair; }
 .pane .plabel .nm { font-size: 12px; color: #eee; max-width: 70%;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pane.cur { box-shadow: inset 0 0 0 2px var(--accent); }
+.pane .pickkey {
+  position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
+  z-index: 3; display: flex; align-items: center; gap: 6px;
+  padding: 6px 12px; border-radius: 8px; cursor: pointer;
+  background: var(--accent); color: #06121f; font-weight: 700; font-size: 13px;
+  box-shadow: 0 2px 8px #000a; pointer-events: auto;
+}
+.pane .pickkey:hover { background: #7ab8ff; }
+.pane .pickkey kbd {
+  background: #06121f; border: 1px solid #06121f; border-bottom-width: 2px;
+  color: #fff; font-size: 13px; padding: 1px 7px;
+}
 .pflag { font-size: 12px; padding: 1px 7px; border-radius: 10px; }
 .pflag.keep { background: var(--keep); color: #06200f; }
 .pflag.reject { background: var(--reject); color: #2a0808; }
@@ -145,7 +164,37 @@ body.mousemode .cell { cursor: crosshair; }
   background: var(--bg2); border: 1px solid var(--line); border-radius: 10px;
   padding: 20px 24px; max-width: 720px; width: 90%;
 }
+.modal-box.wide { max-width: 1000px; }
 .modal-box h2 { margin: 0 0 14px; }
+
+/* ---- delete-rejected picker ---- */
+.del-actions-top { display: flex; align-items: center; gap: 8px; margin: 6px 0 10px; }
+.del-actions-top span { color: var(--muted); margin-left: auto; }
+.del-grid {
+  display: grid; gap: 8px; padding: 6px;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  grid-auto-rows: 120px; max-height: 52vh; overflow-y: auto;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+}
+.del-cell {
+  position: relative; border-radius: 6px; overflow: hidden; cursor: pointer;
+  border: 2px solid transparent; opacity: 0.38; transition: opacity .1s, border-color .1s;
+}
+.del-cell.selected { opacity: 1; border-color: var(--reject); }
+.del-cell:hover { opacity: 1; }
+.del-cell img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.del-cell .del-check {
+  position: absolute; top: 4px; right: 4px; width: 22px; height: 22px;
+  border-radius: 50%; background: var(--reject); color: #fff; font-size: 12px;
+  text-align: center; line-height: 22px; box-shadow: 0 1px 3px #000a; display: none;
+}
+.del-cell.selected .del-check { display: block; }
+.del-cell .typebadge { position: absolute; top: 4px; left: 4px; box-shadow: 0 1px 3px #000a; }
+.del-cell .del-name {
+  position: absolute; bottom: 0; left: 0; right: 0; padding: 2px 5px; font-size: 10px;
+  color: #ddd; background: linear-gradient(#0000, #000c);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .modal-box h3 { margin: 14px 0 6px; color: var(--accent); font-size: 13px; }
 .modal-box ul { margin: 0; padding-left: 0; list-style: none; }
 .modal-box li { margin: 4px 0; color: var(--muted); }

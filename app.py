@@ -23,6 +23,7 @@ import threading
 import webbrowser
 from datetime import datetime
 from pathlib import Path
+from typing import List
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -311,6 +312,7 @@ class DeleteReq(BaseModel):
     confirm: bool = False
     expected_count: int = -1   # client echoes the count it warned about; must match
     permanent: bool = False    # force permanent delete even if recycle bin available
+    paths: List[str] = None    # explicit subset to delete; None = all rejected
 
 
 class ExportReq(BaseModel):
@@ -330,7 +332,19 @@ app = FastAPI(title="Photo Culler")
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    # Cache-bust the JS/CSS by file mtime so browsers never run a stale copy
+    # after an update.
+    def ver(name):
+        try:
+            return str(int((STATIC_DIR / name).stat().st_mtime))
+        except OSError:
+            return "0"
+
+    html = html.replace("/static/styles.css", "/static/styles.css?v=" + ver("styles.css"))
+    html = html.replace("/static/app.js", "/static/app.js?v=" + ver("app.js"))
+    return html
 
 
 @app.get("/api/state")
@@ -448,6 +462,7 @@ def api_export(req: ExportReq):
 
     done = 0
     errors = []
+    moved = []   # (old_path, new_path) for DB path fixups after a move
     for r in rows:
         src = r["path"]
         if not os.path.isfile(src):
@@ -468,11 +483,23 @@ def api_export(req: ExportReq):
         try:
             if req.action == "move":
                 shutil.move(src, target)
+                moved.append((src, os.path.abspath(target)))
             else:
                 shutil.copy2(src, target)
             done += 1
         except Exception as e:  # noqa
             errors.append("{}: {}".format(src, e))
+
+    # A move leaves the source path dangling — repoint each moved file's DB
+    # record to its new location so marks survive and it isn't reported missing.
+    if moved:
+        with _db_lock, db() as conn:
+            for old, new in moved:
+                conn.execute("DELETE FROM photos WHERE path=?", (new,))
+                conn.execute(
+                    "UPDATE photos SET path=?, folder=?, filename=? WHERE path=?",
+                    (new, os.path.dirname(new), os.path.basename(new), old),
+                )
 
     return {"exported": done, "dest": dest, "errors": errors}
 
@@ -481,7 +508,14 @@ def api_export(req: ExportReq):
 def api_delete_rejected(req: DeleteReq):
     with db() as conn:
         rows = conn.execute("SELECT path FROM photos WHERE flag=-1").fetchall()
-    paths = [r["path"] for r in rows]
+    rejected = [r["path"] for r in rows]
+    if req.paths is not None:
+        # only ever delete files that are actually flagged reject, even if the
+        # client sends a stale/larger list
+        sel = set(req.paths)
+        paths = [p for p in rejected if p in sel]
+    else:
+        paths = rejected
     count = len(paths)
 
     if not req.confirm:

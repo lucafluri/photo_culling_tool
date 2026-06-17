@@ -11,13 +11,14 @@ const S = {
   filter: "all",
   typeFilter: "all",   // "all" | "raw" | "heic" | "std" | ".jpg" ...
   sortKey: "name",     // name | taken | mtime | size | rating
-  sortDir: 1,          // 1 asc, -1 desc
+  sortDir: -1,         // 1 asc, -1 desc (default: filename descending = newest first)
   compare: [],         // ordered list of paths in the compare set
   viewer: null,        // null | {mode:'loupe'|'compare', paths:[], cur:int, zoom, panx, pany}
   folder: null,        // currently open folder
   haveTrash: false,    // server can send to recycle bin
   mouseMode: false,    // hotkeys act on the hovered photo
   hover: null,         // hovered grid index (mouse mode)
+  groupRaw: true,      // combine same-named RAW + JPEG into one item
 };
 
 const $ = (id) => document.getElementById(id);
@@ -74,15 +75,65 @@ function typeGroup(ext) {
 }
 
 function ingest(photos) {
+  // a fresh folder load starts with no carried-over compare selection
+  S.compare = [];
+  S.cursor = 0;
   S.photos = photos;
   S.byPath = new Map();
   for (const p of photos) {
     p.ext = extOf(p.filename);
     S.byPath.set(p.path, p);
   }
+  buildGroups();
   populateTypeFilter();
   sortPhotos();   // also calls applyFilter()
 }
+
+// Base name (filename minus extension), lower-cased, for pairing.
+function baseName(p) {
+  return p.filename.slice(0, p.filename.length - p.ext.length).toLowerCase();
+}
+
+// Within a folder, files sharing a base name (e.g. IMG_001.JPG + IMG_001.CR2)
+// are one item. We keep a single visible "primary" cell carrying the member
+// paths; the others are flagged _hidden and dropped from the view. All marks
+// are propagated to every member (see mark()), so server-side export/delete —
+// which key off the flag column — act on the whole group automatically.
+function buildGroups() {
+  for (const p of S.photos) {
+    p.members = null; p.groupExts = null; p._hidden = false;
+    p.hasRaw = p.hasStd = p.hasHeic = false;
+  }
+  if (!S.groupRaw) return;
+
+  const map = new Map();   // "folder|base" -> [photos]
+  for (const p of S.photos) {
+    const key = (p.folder || "") + "|" + baseName(p);
+    (map.get(key) || map.set(key, []).get(key)).push(p);
+  }
+  const order = (p) => typeGroup(p.ext) === "std" ? 0 : (HEIC_EXTS.has(p.ext) ? 1 : 2);
+  for (const members of map.values()) {
+    // only pair up when a RAW is involved (the RAW+JPEG sidecar case)
+    if (members.length < 2 || !members.some((m) => RAW_EXTS.has(m.ext))) continue;
+    // primary = a standard image if present (fast thumbnail), else first by name
+    members.sort((a, b) => order(a) - order(b) ||
+      a.filename.localeCompare(b.filename, undefined, { numeric: true }));
+    const primary = members[0];
+    primary.members = members.map((m) => m.path);
+    primary.groupExts = members.map((m) => m.ext);
+    primary.hasRaw = members.some((m) => RAW_EXTS.has(m.ext));
+    primary.hasStd = members.some((m) => typeGroup(m.ext) === "std");
+    primary.hasHeic = members.some((m) => HEIC_EXTS.has(m.ext));
+    // reconcile display state to the strongest member mark
+    primary.rating = Math.max(...members.map((m) => m.rating || 0));
+    const rej = members.find((m) => m.flag === -1);
+    const keep = members.find((m) => m.flag === 1);
+    primary.flag = primary.flag || (rej ? -1 : keep ? 1 : 0);
+    for (let i = 1; i < members.length; i++) members[i]._hidden = true;
+  }
+}
+
+function visiblePhotos() { return S.photos.filter((p) => !p._hidden); }
 
 function sortKeyVal(p) {
   switch (S.sortKey) {
@@ -204,10 +255,12 @@ function matchesFlag(p, f) {
 }
 function matchesType(p, t) {
   if (t === "all") return true;
-  if (t === "raw" || t === "heic" || t === "std") return typeGroup(p.ext) === t;
-  return p.ext === t;  // exact extension
+  const exts = (p.members && p.members.length) ? p.groupExts : [p.ext];
+  if (t === "raw" || t === "heic" || t === "std") return exts.some((e) => typeGroup(e) === t);
+  return exts.includes(t);  // exact extension
 }
 function matches(p) {
+  if (p._hidden) return false;
   return matchesFlag(p, S.filter) && matchesType(p, S.typeFilter);
 }
 function applyFilter() {
@@ -219,13 +272,14 @@ function applyFilter() {
 
 function updateCounts() {
   let keep = 0, reject = 0, rated = 0;
-  for (const p of S.photos) {
+  const vis = visiblePhotos();
+  for (const p of vis) {
     if (p.flag === 1) keep++;
     else if (p.flag === -1) reject++;
     if (p.rating > 0) rated++;
   }
   $("counts").innerHTML =
-    `<b>${S.photos.length}</b> photos · <b style="color:var(--keep)">${keep}</b> keep · ` +
+    `<b>${vis.length}</b> photos · <b style="color:var(--keep)">${keep}</b> keep · ` +
     `<b style="color:var(--reject)">${reject}</b> reject · <b>${rated}</b> rated` +
     (S.compare.length ? ` · <b style="color:var(--star)">${S.compare.length}</b> compare` : "");
 }
@@ -257,6 +311,14 @@ function cellClass(p) {
 }
 
 function typeBadge(p) {
+  if (p.members && p.members.length > 1) {
+    const parts = [];
+    if (p.hasStd) parts.push("JPG");
+    if (p.hasRaw) parts.push("RAW");
+    if (p.hasHeic) parts.push("HEIC");
+    const title = p.groupExts.join(", ");
+    return `<div class="typebadge combo" title="${title}">${parts.join("+")}</div>`;
+  }
   const g = typeGroup(p.ext);
   if (g === "std") return "";
   const label = p.ext ? p.ext.slice(1).toUpperCase() : "";
@@ -375,15 +437,24 @@ function toggleMouseMode(on) {
 async function mark(path, fields) {
   const p = S.byPath.get(path);
   if (!p) return;
-  if (fields.flag !== undefined) p.flag = fields.flag;
-  if (fields.rating !== undefined) p.rating = fields.rating;
+  // a grouped primary carries its member paths; mark them all so the RAW and
+  // the JPEG stay in lock-step (and the server's flag-based ops hit both)
+  const targets = (p.members && p.members.length) ? p.members : [path];
+  for (const tp of targets) {
+    const t = S.byPath.get(tp);
+    if (!t) continue;
+    if (fields.flag !== undefined) t.flag = fields.flag;
+    if (fields.rating !== undefined) t.rating = fields.rating;
+  }
   // reflect in UI immediately
   const vi = S.view.indexOf(p);
   if (vi >= 0) refreshCell(vi);
   if (S.viewer) renderViewerMeta();
   updateCounts();
-  try { await post("/api/mark", { path, flag: fields.flag, rating: fields.rating }); }
-  catch (e) { toast("Save failed: " + e.message); }
+  try {
+    await Promise.all(targets.map((tp) =>
+      post("/api/mark", { path: tp, flag: fields.flag, rating: fields.rating })));
+  } catch (e) { toast("Save failed: " + e.message); }
 }
 
 // In the grid, hotkeys act on the hovered cell when mouse mode is on,
@@ -394,7 +465,10 @@ function activeIndex() {
 }
 
 function currentPhoto() {
-  if (S.viewer) return S.byPath.get(S.viewer.paths[S.viewer.cur]);
+  if (S.viewer) {
+    if (S.viewer.mode === "tournament") return S.byPath.get(S.viewer.left);
+    return S.byPath.get(S.viewer.paths[S.viewer.cur]);
+  }
   return S.view[activeIndex()];
 }
 
@@ -421,7 +495,7 @@ function advanceCurrent() {
 function toggleCompare(path) {
   const i = S.compare.indexOf(path);
   if (i >= 0) S.compare.splice(i, 1);
-  else { if (S.compare.length >= 6) { toast("Compare max 6"); return; } S.compare.push(path); }
+  else { if (S.compare.length >= 16) { toast("Compare max 16"); return; } S.compare.push(path); }
   const vi = S.view.findIndex((p) => p.path === path);
   if (vi >= 0) refreshCell(vi);
   // renumber others
@@ -439,6 +513,38 @@ function openLoupe(i) {
   buildPanes();
 }
 
+// Home-row keys map to compare panes 1/2/3 for quick best-pick.
+const PICK_KEYS = ["s", "d", "f"];
+
+// Empty the compare set and re-render, keeping the grid scrolled where it was
+// (clearing the selection should never jump the user back to the top).
+function clearCompare(msg) {
+  S.compare = [];
+  const sy = grid.scrollTop;
+  applyFilter();
+  grid.scrollTop = sy;
+  if (msg) toast(msg);
+}
+
+// Finish a comparison: keep `winner`, reject everyone else in `contenders`,
+// clear the compare set, close the viewer.
+function finishCompare(winner, contenders) {
+  contenders.forEach((path) => mark(path, { flag: path === winner ? 1 : -1 }));
+  const w = S.byPath.get(winner);
+  toast("Best: " + (w ? w.filename : "?") + " · rejected the other " + (contenders.length - 1));
+  closeViewer();
+  clearCompare();   // re-render (flags changed + compare numbers cleared), keep scroll
+}
+
+// Side-by-side pick (≤3 images): keep pane `idx`, reject the rest, finish.
+function pickBest(idx) {
+  const v = S.viewer;
+  if (!v || v.mode !== "compare") return;
+  const winner = v.paths[idx];
+  if (!winner) return;
+  finishCompare(winner, v.paths.slice());
+}
+
 function openCompare() {
   let paths = S.compare.slice();
   if (paths.length < 2) {
@@ -447,14 +553,64 @@ function openCompare() {
     paths = S.view.slice(start, start + 2).map((p) => p.path);
   }
   if (paths.length < 1) return;
-  S.viewer = { mode: "compare", paths, cur: 0, zoom: 1, panx: 0, pany: 0 };
+  if (paths.length <= 3) {
+    S.viewer = { mode: "compare", paths, cur: 0, zoom: 1, panx: 0, pany: 0 };
+    buildPanes();
+  } else {
+    startTournament(paths);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tournament: >3 images, decided by binary left/right votes (king-of-the-hill).
+// The current champion stays on the left and defends against the next
+// challenger on the right; the winner of each match defends the next, until
+// one image has beaten all others.
+// ---------------------------------------------------------------------------
+function startTournament(paths) {
+  S.viewer = {
+    mode: "tournament",
+    contenders: paths.slice(),  // every image in the bracket
+    champ: paths[0],            // current champion (shown left)
+    nextIdx: 1,                 // index of the next challenger in `contenders`
+    left: paths[0],
+    right: paths[1],
+    round: 1,
+    total: paths.length - 1,    // total matches needed
+    cur: 0,                     // focal pane for zoom (always left)
+    zoom: 1, panx: 0, pany: 0,
+  };
   buildPanes();
+}
+
+function tournamentVote(side) {
+  const v = S.viewer;
+  if (!v || v.mode !== "tournament") return;
+  v.champ = side === "right" ? v.right : v.left;
+  v.nextIdx++;
+  if (v.nextIdx >= v.contenders.length) {
+    finishCompare(v.champ, v.contenders.slice());
+    return;
+  }
+  v.round++;
+  v.left = v.champ;
+  v.right = v.contenders[v.nextIdx];
+  v.zoom = 1; v.panx = 0; v.pany = 0;
+  buildPanes();
+}
+
+// Which paths get a pane right now, in order.
+function paneList() {
+  const v = S.viewer;
+  if (v.mode === "loupe") return [v.paths[v.cur]];
+  if (v.mode === "tournament") return [v.left, v.right];
+  return v.paths;
 }
 
 function buildPanes() {
   viewer.classList.remove("hidden");
   panesEl.innerHTML = "";
-  const list = S.viewer.mode === "loupe" ? [S.viewer.paths[S.viewer.cur]] : S.viewer.paths;
+  const list = paneList();
   S.viewer._fit = [];
   list.forEach((path, idx) => {
     const pane = document.createElement("div");
@@ -468,6 +624,30 @@ function buildPanes() {
     label.className = "plabel";
     pane.appendChild(label);
     pane.appendChild(img);
+    // best-pick hotkey badge (compare, ≤3 images)
+    if (S.viewer.mode === "compare" && list.length <= 3) {
+      const pk = document.createElement("div");
+      pk.className = "pickkey";
+      const key = (PICK_KEYS[idx] || "").toUpperCase();
+      pk.innerHTML = `<kbd>${key}</kbd> keep this`;
+      pk.title = "Press " + key + " to keep this and reject the others";
+      pk.addEventListener("mousedown", (e) => e.stopPropagation());
+      pk.addEventListener("click", (e) => { e.stopPropagation(); pickBest(idx); });
+      pane.appendChild(pk);
+    }
+    // tournament vote badge (left vs right)
+    if (S.viewer.mode === "tournament") {
+      const isLeft = idx === 0;
+      const pk = document.createElement("div");
+      pk.className = "pickkey";
+      pk.innerHTML = isLeft
+        ? `<kbd>S</kbd> / <kbd>←</kbd> better`
+        : `better <kbd>F</kbd> / <kbd>→</kbd>`;
+      pk.title = "Vote this image as the better of the two";
+      pk.addEventListener("mousedown", (e) => e.stopPropagation());
+      pk.addEventListener("click", (e) => { e.stopPropagation(); tournamentVote(isLeft ? "left" : "right"); });
+      pane.appendChild(pk);
+    }
     pane._img = img; pane._label = label;
     attachPaneHandlers(pane, idx);
     panesEl.appendChild(pane);
@@ -581,7 +761,7 @@ function loupeGo(i) {
 function renderViewerMeta() {
   if (!S.viewer) return;
   const v = S.viewer;
-  const list = v.mode === "loupe" ? [v.paths[v.cur]] : v.paths;
+  const list = paneList();
   [...panesEl.children].forEach((pane) => {
     const idx = +pane.dataset.idx;
     const path = list[idx];
@@ -599,6 +779,13 @@ function renderViewerMeta() {
 
 function updateHud() {
   const v = S.viewer; if (!v) return;
+  if (v.mode === "tournament") {
+    const l = S.byPath.get(v.left), r = S.byPath.get(v.right);
+    $("viewerHud").innerHTML =
+      `<span>Which is better? <b>${l ? l.filename : ""}</b> vs <b>${r ? r.filename : ""}</b></span>` +
+      `<span>match ${v.round}/${v.total} · ←/S = left · →/F = right · Esc cancels</span>`;
+    return;
+  }
   const p = currentPhoto();
   const pos = v.mode === "loupe" ? `${v.cur + 1}/${v.paths.length}` : `compare ${v.paths.length}`;
   $("viewerHud").innerHTML =
@@ -629,6 +816,10 @@ function inField(e) {
 document.addEventListener("keydown", (e) => {
   // modals
   if (!$("help").classList.contains("hidden") && e.key === "Escape") { $("help").classList.add("hidden"); return; }
+  if (!$("deleteModal").classList.contains("hidden")) {
+    if (e.key === "Escape") $("deleteModal").classList.add("hidden");
+    return;
+  }
   if (!$("exportModal").classList.contains("hidden")) {
     if (e.key === "Escape") $("exportModal").classList.add("hidden");
     return;
@@ -646,10 +837,26 @@ document.addEventListener("keydown", (e) => {
     case "q": markCurrent({ flag: 0 }, false); return;
     case "`": markCurrent({ rating: 0 }, false); return;
   }
+  // Compare best-pick: in compare view with ≤3 images, S/D/F keep that pane,
+  // reject the rest, and close. (Overrides compare nav/zoom for those keys.)
+  if (S.viewer && S.viewer.mode === "compare" && S.viewer.paths.length <= 3) {
+    const pi = PICK_KEYS.indexOf(k);
+    if (pi >= 0 && pi < S.viewer.paths.length) { pickBest(pi); return; }
+  }
   if (k >= "1" && k <= "5") { markCurrent({ rating: parseInt(k, 10) }, false); return; }
 
   if (inViewer) {
     if (k === "escape") { closeViewer(); return; }
+    if (S.viewer.mode === "tournament") {
+      switch (k) {
+        case "arrowleft": case "s": tournamentVote("left"); return;
+        case "arrowright": case "f": tournamentVote("right"); return;
+        case "arrowup": case "e": case "+": case "=": zoomAtCenter(1.25); return;
+        case "arrowdown": case "d": case "-": case "_": zoomAtCenter(0.8); return;
+        case "z": resetZoom(); return;
+      }
+      return;
+    }
     switch (k) {
       case "arrowright": case "f":
         if (S.viewer.mode === "loupe") loupeGo(S.viewer.cur + 1);
@@ -684,7 +891,7 @@ document.addEventListener("keydown", (e) => {
       e.preventDefault(); return;
     }
     case "c": openCompare(); return;
-    case "x": S.compare = []; applyFilter(); toast("Compare cleared"); return;
+    case "x": clearCompare("Compare cleared"); return;
     case "t": cycleFilter(); return;
     case "b": toggleMouseMode(); return;
     case "v": case "?": $("help").classList.remove("hidden"); return;
@@ -726,13 +933,20 @@ async function runExport() {
     if (res.errors.length) msg += `\n${res.errors.length} errors:\n` + res.errors.slice(0, 5).join("\n");
     $("exStatus").textContent = msg;
     toast(`Exported ${res.exported} files`);
-    if ($("exAction").value === "move") restore();  // refresh since files moved
+    reloadFolder();  // rescan disk: reflects moved-out files and any copies in-tree
   } catch (e) { $("exStatus").textContent = "Error: " + e.message; }
 }
 
-function rejectedCount() { return S.photos.filter((p) => p.flag === -1).length; }
+function rejectedCount() { return visiblePhotos().filter((p) => p.flag === -1).length; }
+
+function defaultExportDest() {
+  if (!S.folder) return "";
+  const sep = S.folder.includes("\\") ? "\\" : "/";
+  return S.folder.replace(/[\\/]+$/, "") + sep + "cull_output";
+}
 
 function openExport() {
+  if (!$("exDest").value.trim()) $("exDest").value = defaultExportDest();
   const n = rejectedCount();
   const btn = $("delRejected");
   btn.textContent = `🗑 Delete rejected (${n})`;
@@ -744,34 +958,91 @@ function openExport() {
   $("exportModal").classList.remove("hidden");
 }
 
-async function deleteRejected() {
-  const n = rejectedCount();
-  if (!n) return;
-  const where = S.haveTrash ? "the Recycle Bin" : "PERMANENTLY DELETED from disk";
+// Set of paths currently checked for deletion in the delete modal.
+let delSelected = new Set();
 
-  // Warning 1
-  if (!confirm(`Delete ${n} rejected photo${n > 1 ? "s" : ""}?\n\nThey will be sent to ${where}.`))
-    return;
-  // Warning 2 — make them acknowledge the consequence explicitly
-  if (!S.haveTrash) {
-    if (!confirm(`⚠ This CANNOT be undone — ${n} file${n > 1 ? "s" : ""} will be erased.\n\nProceed?`))
-      return;
-  } else {
-    if (!confirm(`Are you sure? ${n} file${n > 1 ? "s" : ""} will be removed from your library.`))
-      return;
-  }
+function openDeleteModal() {
+  const rejected = visiblePhotos().filter((p) => p.flag === -1);
+  if (!rejected.length) { toast("No rejected photos"); return; }
+  delSelected = new Set(rejected.map((p) => p.path));
 
-  $("exStatus").textContent = "Deleting…";
+  const where = S.haveTrash
+    ? "moved to the <b>Recycle Bin</b> (recoverable)"
+    : "<b>permanently deleted</b> from disk (NOT recoverable)";
+  $("delModalInfo").innerHTML =
+    `The photos below will be ${where}. Click any thumbnail to <b>deselect</b> ` +
+    `(keep) it — only the highlighted ones get deleted. ` +
+    `RAW+JPEG groups are deleted together.`;
+
+  const g = $("delGrid");
+  g.innerHTML = "";
+  const frag = document.createDocumentFragment();
+  rejected.forEach((p) => {
+    const cell = document.createElement("div");
+    cell.className = "del-cell selected";
+    cell.dataset.path = p.path;
+    cell.innerHTML =
+      `<img loading="lazy" src="${thumbUrl(p.path)}" alt="" />` +
+      `<div class="del-check">🗑</div>` +
+      typeBadge(p) +
+      `<div class="del-name">${p.filename}</div>`;
+    cell.addEventListener("click", () => toggleDelSelect(p.path, cell));
+    frag.appendChild(cell);
+  });
+  g.appendChild(frag);
+
+  updateDelCount();
+  $("delStatus").textContent = "";
+  $("exportModal").classList.add("hidden");
+  $("deleteModal").classList.remove("hidden");
+}
+
+function toggleDelSelect(path, cell) {
+  if (delSelected.has(path)) { delSelected.delete(path); cell.classList.remove("selected"); }
+  else { delSelected.add(path); cell.classList.add("selected"); }
+  updateDelCount();
+}
+
+function delSetAll(on) {
+  $("delGrid").querySelectorAll(".del-cell").forEach((c) => {
+    const path = c.dataset.path;
+    if (on) { delSelected.add(path); c.classList.add("selected"); }
+    else { delSelected.delete(path); c.classList.remove("selected"); }
+  });
+  updateDelCount();
+}
+
+function updateDelCount() {
+  const n = delSelected.size;
+  $("delSelCount").textContent = `${n} selected for deletion`;
+  const btn = $("delConfirm");
+  btn.disabled = n === 0;
+  btn.textContent = `🗑 Delete ${n} selected`;
+}
+
+async function confirmDelete() {
+  const items = [...delSelected];
+  if (!items.length) return;
+  // expand grouped items so every member file (RAW + JPEG) is deleted
+  const paths = [];
+  items.forEach((pp) => {
+    const p = S.byPath.get(pp);
+    const mem = (p && p.members && p.members.length) ? p.members : [pp];
+    mem.forEach((m) => { if (!paths.includes(m)) paths.push(m); });
+  });
+  $("delStatus").textContent = "Deleting…";
   try {
-    const res = await post("/api/delete-rejected", { confirm: true, expected_count: n });
+    const res = await post("/api/delete-rejected",
+      { confirm: true, expected_count: paths.length, paths });
     let msg = `Deleted ${res.deleted} file${res.deleted === 1 ? "" : "s"} (${res.method.replace("_", " ")}).`;
     if (res.errors.length) msg += `\n${res.errors.length} errors:\n` + res.errors.slice(0, 5).join("\n");
-    $("exStatus").textContent = msg;
     toast(`Deleted ${res.deleted} rejected`);
+    $("deleteModal").classList.add("hidden");
+    $("exStatus").textContent = msg;
     reloadFolder();  // refresh library
   } catch (e) {
-    $("exStatus").textContent = "Error: " + e.message;
-    if (/count changed/.test(e.message)) reloadFolder();
+    $("delStatus").textContent = "Error: " + e.message;
+    if (/count changed/.test(e.message)) { $("deleteModal").classList.add("hidden"); reloadFolder(); }
   }
 }
 
@@ -780,7 +1051,11 @@ async function deleteRejected() {
 // ---------------------------------------------------------------------------
 $("browseBtn").addEventListener("click", browseFolder);
 $("reloadBtn").addEventListener("click", reloadFolder);
-$("delRejected").addEventListener("click", deleteRejected);
+$("delRejected").addEventListener("click", openDeleteModal);
+$("delCancel").addEventListener("click", () => $("deleteModal").classList.add("hidden"));
+$("delConfirm").addEventListener("click", confirmDelete);
+$("delSelectAll").addEventListener("click", () => delSetAll(true));
+$("delSelectNone").addEventListener("click", () => delSetAll(false));
 $("exBrowse").addEventListener("click", async () => {
   try {
     const res = await api("/api/pick-folder");
@@ -798,8 +1073,36 @@ $("sortDir").addEventListener("click", () => {
   $("sortDir").textContent = S.sortDir === 1 ? "↑" : "↓";
   sortPhotos();
 });
+$("groupRaw").addEventListener("change", (e) => {
+  S.groupRaw = e.target.checked;
+  localStorage.setItem("groupRaw", S.groupRaw ? "1" : "0");
+  buildGroups();
+  applyFilter();
+});
 $("exportBtn").addEventListener("click", openExport);
 $("exCancel").addEventListener("click", () => $("exportModal").classList.add("hidden"));
 $("exRun").addEventListener("click", runExport);
+
+// ---- grid / thumbnail size slider (persisted) ----
+function applyGridSize(px) {
+  document.documentElement.style.setProperty("--cell", px + "px");
+}
+(function initGridSize() {
+  const slider = $("gridSize");
+  const saved = parseInt(localStorage.getItem("gridSize") || "", 10);
+  if (saved >= +slider.min && saved <= +slider.max) slider.value = saved;
+  applyGridSize(slider.value);
+  slider.addEventListener("input", () => {
+    applyGridSize(slider.value);
+    localStorage.setItem("gridSize", slider.value);
+  });
+})();
+
+// ---- RAW+JPEG grouping (persisted) ----
+(function initGroupRaw() {
+  const saved = localStorage.getItem("groupRaw");
+  if (saved !== null) S.groupRaw = saved === "1";
+  $("groupRaw").checked = S.groupRaw;
+})();
 
 restore();
