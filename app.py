@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import List
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -71,6 +71,9 @@ ALL_EXTS = STD_EXTS | HEIC_EXTS | RAW_EXTS
 
 THUMB_SIZE = 480       # grid thumbnails (long edge, px)
 PREVIEW_SIZE = 2400    # loupe/compare preview (long edge, px)
+
+# Column list returned to the UI; one source so the two photo SELECTs can't drift.
+PHOTO_COLS = "path, filename, folder, flag, rating, mtime, size, taken"
 
 # Flag values: 1 = keep/pick, -1 = reject, 0 = none.
 
@@ -157,7 +160,7 @@ def _load_pil(path):
             except Exception:
                 img = None
             if img is None:
-                rgb = raw.postprocess(use_camera_wb=True, half_size=True, no_auto_bright=False)
+                rgb = raw.postprocess(use_camera_wb=True, half_size=True)
                 img = Image.fromarray(rgb)
     else:
         img = Image.open(path)
@@ -285,7 +288,7 @@ def list_photos(paths):
     with db() as conn:
         for p in paths:
             row = conn.execute(
-                "SELECT path, filename, folder, flag, rating, mtime, size, taken FROM photos WHERE path=?",
+                f"SELECT {PHOTO_COLS} FROM photos WHERE path=?",
                 (p,),
             ).fetchone()
             if row:
@@ -355,7 +358,7 @@ def api_state():
     if folder and os.path.isdir(folder):
         with db() as conn:
             rows = conn.execute(
-                "SELECT path, filename, folder, flag, rating, mtime, size, taken FROM photos WHERE folder=? ORDER BY path",
+                f"SELECT {PHOTO_COLS} FROM photos WHERE folder=? ORDER BY path",
                 (os.path.abspath(folder),),
             ).fetchall()
         photos = [dict(r) for r in rows]
@@ -560,7 +563,6 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 def main():
     import uvicorn
-    init_db()
     host = "127.0.0.1"
     port = 8000
     url = "http://{}:{}".format(host, port)

@@ -212,11 +212,17 @@ async function scanFolder(folder) {
   } catch (e) { toast("Error: " + e.message, 4000); }
 }
 
-async function browseFolder() {
+// Native OS folder picker; returns the chosen path or null. Callers decide what
+// to do with it (scan a library, fill the export dest, …).
+async function pickFolder() {
   try {
-    const res = await api("/api/pick-folder");
-    if (res.folder) scanFolder(res.folder);
-  } catch (e) { toast("Folder picker failed: " + e.message, 4000); }
+    return (await api("/api/pick-folder")).folder || null;
+  } catch (e) { toast("Folder picker failed: " + e.message, 4000); return null; }
+}
+
+async function browseFolder() {
+  const folder = await pickFolder();
+  if (folder) scanFolder(folder);
 }
 
 function reloadFolder() {
@@ -1057,10 +1063,8 @@ $("delConfirm").addEventListener("click", confirmDelete);
 $("delSelectAll").addEventListener("click", () => delSetAll(true));
 $("delSelectNone").addEventListener("click", () => delSetAll(false));
 $("exBrowse").addEventListener("click", async () => {
-  try {
-    const res = await api("/api/pick-folder");
-    if (res.folder) $("exDest").value = res.folder;
-  } catch (e) { toast("Folder picker failed: " + e.message, 4000); }
+  const folder = await pickFolder();
+  if (folder) $("exDest").value = folder;
 });
 $("helpBtn").addEventListener("click", () => $("help").classList.remove("hidden"));
 $("mouseBtn").addEventListener("click", () => toggleMouseMode());
