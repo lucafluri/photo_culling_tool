@@ -148,6 +148,36 @@ body.mousemode .cell { cursor: crosshair; }
 .pflag { font-size: 12px; padding: 1px 7px; border-radius: 10px; }
 .pflag.keep { background: var(--keep); color: #06200f; }
 .pflag.reject { background: var(--reject); color: #2a0808; }
+/* ---- editor ---- */
+.cell .editbadge {
+  position: absolute; bottom: 4px; left: 4px; z-index: 2; font-size: 11px;
+  color: var(--star); text-shadow: 0 1px 2px #000; pointer-events: none;
+}
+.editbar {
+  position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 5;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  justify-content: center; max-width: 96%;
+  padding: 8px 12px; background: #000d; border: 1px solid var(--line);
+  border-radius: 10px; box-shadow: 0 2px 10px #000a;
+}
+.editbar .editgroup { display: flex; align-items: center; gap: 4px; }
+.editbar button { padding: 5px 9px; }
+.editbar label {
+  display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 14px;
+}
+.editbar output {
+  min-width: 34px; text-align: right; color: var(--txt); font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.editbar input[type=range] {
+  width: 120px; height: 4px; accent-color: var(--accent); cursor: pointer;
+}
+.cropoverlay { position: absolute; inset: 0; z-index: 6; cursor: crosshair; }
+.cropsel {
+  position: absolute; border: 1px dashed #fff; background: #4a9eff22;
+  box-shadow: 0 0 0 100vmax #0008; pointer-events: none;
+}
+
 .hud {
   padding: 6px 12px; background: #111; border-top: 1px solid var(--line);
   color: var(--muted); display: flex; justify-content: space-between;
@@ -209,6 +239,25 @@ body.mousemode .cell { cursor: crosshair; }
 .modal-box select { width: 100%; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
 .status { color: var(--muted); margin-top: 8px; min-height: 18px; white-space: pre-wrap; }
+.exq { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+.exq select { width: auto; }
+.exfiles {
+  margin-top: 10px; max-height: 220px; overflow-y: auto;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 6px 10px; font-size: 12px;
+}
+.exfiles .exhead { color: var(--txt); font-weight: 600; margin-bottom: 4px; }
+.exrow { display: flex; align-items: baseline; gap: 8px; padding: 2px 0; color: var(--muted); }
+.exrow .exname { color: var(--txt); white-space: nowrap; }
+.exrow .excomp {
+  color: var(--keep); font-size: 10px; border: 1px solid var(--keep);
+  border-radius: 4px; padding: 0 4px;
+}
+.exrow .expath {
+  margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 60%; opacity: .7;
+}
+.exrow.err { color: var(--reject); }
 .danger { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
 .danger h3 { color: var(--reject); margin-top: 0; }
 .danger p { color: var(--muted); margin: 4px 0 10px; }

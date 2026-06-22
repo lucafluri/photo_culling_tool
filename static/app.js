@@ -19,6 +19,8 @@ const S = {
   mouseMode: false,    // hotkeys act on the hovered photo
   hover: null,         // hovered grid index (mouse mode)
   groupRaw: true,      // combine same-named RAW + JPEG into one item
+  editor: null,        // null | {path, hist:[edits...], idx} — active loupe editor
+  cropMode: false,     // drawing a crop box
 };
 
 const $ = (id) => document.getElementById(id);
@@ -41,8 +43,21 @@ async function api(path, opts) {
 const post = (path, body) =>
   api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
-const thumbUrl = (p) => "/api/thumb?path=" + encodeURIComponent(p);
-const previewUrl = (p) => "/api/preview?path=" + encodeURIComponent(p);
+// `_ev` (edit version) bumps when a photo's stored edits change, busting the
+// browser cache for its thumb/preview without touching the server cache key.
+function verSuffix(path) {
+  const x = S.byPath.get(path);
+  return x && x._ev ? "&v=" + x._ev : "";
+}
+const thumbUrl = (p) => "/api/thumb?path=" + encodeURIComponent(p) + verSuffix(p);
+// Pass `editsObj` to render a live editor preview of those exact edits; omit it
+// to show the photo's stored edits.
+function previewUrl(p, editsObj) {
+  let u = "/api/preview?path=" + encodeURIComponent(p);
+  if (editsObj !== undefined) u += "&edits=" + encodeURIComponent(JSON.stringify(editsObj || {}));
+  else u += verSuffix(p);
+  return u;
+}
 
 // ---------------------------------------------------------------------------
 // Toast
@@ -82,6 +97,7 @@ function ingest(photos) {
   S.byPath = new Map();
   for (const p of photos) {
     p.ext = extOf(p.filename);
+    if (typeof p.edits === "string") { try { p.edits = JSON.parse(p.edits); } catch (e) { p.edits = null; } }
     S.byPath.set(p.path, p);
   }
   buildGroups();
@@ -352,6 +368,7 @@ function renderGrid() {
       `<img data-src="${thumbUrl(p.path)}" alt="" />` +
       `<div class="name">${p.filename}</div>` +
       typeBadge(p) +
+      (p.edits ? `<div class="editbadge" title="Edited">✎</div>` : "") +
       (cmpIdx >= 0 ? `<div class="cmpnum">${cmpIdx + 1}</div>` : "") +
       `<div class="badges"><span class="flag"></span><span class="stars">${starStr(p.rating)}</span></div>`;
     if (i === S.cursor) cell.classList.add("sel");
@@ -658,6 +675,13 @@ function buildPanes() {
     attachPaneHandlers(pane, idx);
     panesEl.appendChild(pane);
   });
+  // editor is ambient in loupe (single image), hidden in compare/tournament
+  if (S.viewer.mode === "loupe") {
+    bindEditor(S.viewer.paths[S.viewer.cur]);
+  } else {
+    S.editor = null;
+    $("editBar").classList.add("hidden");
+  }
   renderViewerMeta();
 }
 
@@ -761,6 +785,7 @@ function loupeGo(i) {
   // keep grid cursor in sync
   const gi = S.view.findIndex((p) => p.path === v.paths[v.cur]);
   if (gi >= 0) setCursor(gi, true);
+  if (S.editor) bindEditor(v.paths[v.cur]);   // editor follows the current photo
   renderViewerMeta();
 }
 
@@ -801,6 +826,10 @@ function updateHud() {
 
 function closeViewer() {
   S.viewer = null;
+  S.editor = null; S.cropMode = false;
+  const ov = document.getElementById("cropOverlay");
+  if (ov) ov.remove();
+  $("editBar").classList.add("hidden");
   viewer.classList.add("hidden");
   panesEl.innerHTML = "";
 }
@@ -812,6 +841,229 @@ window.addEventListener("resize", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Editor (loupe only): non-destructive rotate / flip / crop / tone.
+// Edits live in a history stack (undo/redo) and are persisted per-photo; the
+// originals are never written, so Reset / clearing edits fully reverts.
+// ---------------------------------------------------------------------------
+const clone = (o) => JSON.parse(JSON.stringify(o || {}));
+const editorPhoto = () => (S.editor ? S.byPath.get(S.editor.path) : null);
+const curEdits = () => (S.editor ? S.editor.hist[S.editor.idx] : {});
+
+// The editor is ambient in loupe view: the bar is always shown and re-binds to
+// whatever photo is current, so navigating keeps editing the right one.
+function bindEditor(path) {
+  const p = S.byPath.get(path);
+  if (!p) return;
+  if (S.cropMode) exitCropMode();
+  S.editor = { path, hist: [clone(p.edits)], idx: 0 };
+  $("editBar").classList.remove("hidden");
+  syncEditControls();
+}
+
+// push a new state (dropping any redo branch), persist, re-render
+function pushEdit(edits) {
+  const e = S.editor;
+  e.hist = e.hist.slice(0, e.idx + 1);
+  e.hist.push(edits);
+  e.idx = e.hist.length - 1;
+  commitEdit();
+}
+function undoEdit() { const e = S.editor; if (e && e.idx > 0) { e.idx--; commitEdit(true); } }
+function redoEdit() { const e = S.editor; if (e && e.idx < e.hist.length - 1) { e.idx++; commitEdit(true); } }
+
+async function commitEdit(syncControls) {
+  const p = editorPhoto();
+  if (!p) return;
+  const edits = curEdits();
+  p.edits = (edits && Object.keys(edits).length) ? edits : null;
+  p._ev = (p._ev || 0) + 1;   // bust browser cache for thumb/stored preview
+  if (syncControls) syncEditControls();
+  renderEditPreview();
+  const vi = S.view.indexOf(p);
+  if (vi >= 0) refreshCell(vi);
+  try { await post("/api/edit", { path: p.path, edits: p.edits }); }
+  catch (err) { toast("Edit save failed: " + err.message); }
+}
+
+// live preview in the pane straight from the edits dict (no DB round-trip)
+function renderEditPreview(overrideEdits) {
+  const pane = panesEl.children[0];
+  if (!pane) return;
+  const img = pane._img;
+  const edits = overrideEdits !== undefined ? overrideEdits : curEdits();
+  img.onload = () => { computeFit(0, pane, img); applyTransform(); updateHud(); };
+  img.src = previewUrl(S.editor.path, edits);
+}
+
+function syncEditControls() {
+  const e = curEdits();
+  $("editBar").querySelectorAll("input[data-edit]").forEach((inp) => {
+    const v = e[inp.dataset.edit] != null ? e[inp.dataset.edit] : 1;
+    inp.value = v;
+    const out = inp.parentElement.querySelector("output");
+    if (out) out.textContent = (+v).toFixed(2);
+  });
+  $("cropBtn").classList.toggle("active", !!e.crop || S.cropMode);
+}
+
+function editAction(act) {
+  const e = curEdits();
+  if (act === "rotL" || act === "rotR") {
+    const n = clone(e);
+    n.rot = (((n.rot || 0) + (act === "rotR" ? 90 : 270)) % 360);
+    delete n.crop;   // crop coords are tied to the old rotation — drop them
+    pushEdit(n); return;
+  }
+  if (act === "flipH" || act === "flipV") {
+    const n = clone(e); n[act] = !n[act]; delete n.crop; pushEdit(n); return;
+  }
+  if (act === "crop") { S.cropMode ? exitCropMode() : enterCropMode(); return; }
+  if (act === "undo") return undoEdit();
+  if (act === "redo") return redoEdit();
+  if (act === "reset") { if (S.cropMode) exitCropMode(); pushEdit({}); return; }
+}
+
+// ---- tonal sliders: live CSS-filter preview while dragging, bake on release ----
+const TONAL = { bright: "brightness", contrast: "contrast", saturation: "saturate" };
+let sliderDragging = false;
+
+function geomEdits() {
+  const e = clone(curEdits());
+  delete e.bright; delete e.contrast; delete e.saturation; delete e.sharpness;
+  return e;
+}
+function liveFilter() {
+  return Object.entries(TONAL).map(([k, fn]) => {
+    const inp = $("editBar").querySelector(`input[data-edit="${k}"]`);
+    return `${fn}(${inp ? inp.value : 1})`;
+  }).join(" ");
+}
+function sliderInput(inp) {
+  const out = inp.parentElement.querySelector("output");
+  if (out) out.textContent = parseFloat(inp.value).toFixed(2);
+  const pane = panesEl.children[0];
+  if (!pane) return;
+  // first move: drop the baked-in tonal layer so the live filter isn't doubled
+  if (!sliderDragging) { sliderDragging = true; pane._img.src = previewUrl(S.editor.path, geomEdits()); }
+  pane._img.style.filter = liveFilter();   // sharpness has no CSS equiv — baked on release
+}
+function sliderCommit(inp) {
+  sliderDragging = false;
+  const pane = panesEl.children[0];
+  if (pane) pane._img.style.filter = "";
+  const n = clone(curEdits());
+  const val = parseFloat(inp.value);
+  if (Math.abs(val - 1) < 1e-6) delete n[inp.dataset.edit]; else n[inp.dataset.edit] = val;
+  pushEdit(n);   // server bakes the real result (incl. sharpness)
+}
+
+// ---- crop: drag a box on the (un-cropped) rotated frame ----
+function enterCropMode() {
+  if (!S.editor) return;
+  S.cropMode = true;
+  $("cropBtn").classList.add("active");
+  toast("Drag a box to crop · Esc cancels");
+  const noCrop = clone(curEdits()); delete noCrop.crop;
+  const pane = panesEl.children[0];
+  const img = pane._img;
+  const url = previewUrl(S.editor.path, noCrop);
+  const ready = () => {
+    computeFit(0, pane, img);
+    S.viewer.zoom = 1; S.viewer.panx = 0; S.viewer.pany = 0;
+    applyTransform();
+    buildCropOverlay(pane);
+  };
+  img.onload = ready;
+  // if the un-cropped frame is already what's displayed, onload won't fire
+  if (img.getAttribute("src") === url && img.complete && img.naturalWidth) ready();
+  else img.src = url;
+}
+
+function exitCropMode() {
+  S.cropMode = false;
+  $("cropBtn").classList.remove("active");
+  const ov = document.getElementById("cropOverlay");
+  if (ov) ov.remove();
+  if (S.editor) renderEditPreview();
+}
+
+function buildCropOverlay(pane) {
+  const f = S.viewer._fit[0];
+  if (!f) return;
+  const old = document.getElementById("cropOverlay");
+  if (old) old.remove();
+  const ov = document.createElement("div");
+  ov.id = "cropOverlay"; ov.className = "cropoverlay";
+  const sel = document.createElement("div");
+  sel.className = "cropsel hidden";
+  ov.appendChild(sel);
+  pane.appendChild(ov);
+
+  // displayed image rect inside the pane (zoom 1, no pan)
+  const imgW = f.nw * f.fit, imgH = f.nh * f.fit;
+  const imgL = (f.PW - imgW) / 2, imgT = (f.PH - imgH) / 2;
+  const clampX = (x) => Math.max(imgL, Math.min(imgL + imgW, x));
+  const clampY = (y) => Math.max(imgT, Math.min(imgT + imgH, y));
+
+  let drag = false, sx = 0, sy = 0;
+  ov.addEventListener("mousedown", (e) => {
+    e.preventDefault(); e.stopPropagation();
+    const r = ov.getBoundingClientRect();
+    drag = true; sx = clampX(e.clientX - r.left); sy = clampY(e.clientY - r.top);
+    sel.classList.remove("hidden");
+    sel.style.left = sx + "px"; sel.style.top = sy + "px";
+    sel.style.width = sel.style.height = "0px";
+  });
+  ov.addEventListener("mousemove", (e) => {
+    if (!drag) return;
+    const r = ov.getBoundingClientRect();
+    const cx = clampX(e.clientX - r.left), cy = clampY(e.clientY - r.top);
+    sel.style.left = Math.min(sx, cx) + "px"; sel.style.top = Math.min(sy, cy) + "px";
+    sel.style.width = Math.abs(cx - sx) + "px"; sel.style.height = Math.abs(cy - sy) + "px";
+  });
+  ov.addEventListener("mouseup", (e) => {
+    if (!drag) return; drag = false;
+    const r = ov.getBoundingClientRect();
+    const cx = clampX(e.clientX - r.left), cy = clampY(e.clientY - r.top);
+    const x0 = Math.min(sx, cx), y0 = Math.min(sy, cy);
+    const x1 = Math.max(sx, cx), y1 = Math.max(sy, cy);
+    if (x1 - x0 < 8 || y1 - y0 < 8) { toast("Crop too small"); return; }
+    const crop = [(x0 - imgL) / imgW, (y0 - imgT) / imgH,
+                  (x1 - imgL) / imgW, (y1 - imgT) / imgH]
+                 .map((n) => Math.max(0, Math.min(1, +n.toFixed(4))));
+    S.cropMode = false; $("cropBtn").classList.remove("active"); ov.remove();
+    const n = clone(curEdits()); n.crop = crop;
+    pushEdit(n);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Date split
+// ---------------------------------------------------------------------------
+function openSplit() {
+  if (!S.folder) { toast("Open a folder first"); return; }
+  $("spStatus").textContent = "";
+  $("splitModal").classList.remove("hidden");
+}
+async function runSplit() {
+  $("spStatus").textContent = "Working…";
+  try {
+    const res = await post("/api/split-by-date", {
+      granularity: $("spGran").value, source: $("spSrc").value,
+      action: $("spAction").value, dest: $("spDest").value.trim() || null,
+    });
+    const verb = res.action === "copy" ? "Copied" : "Moved";
+    let msg = `${verb} ${res.moved} files into date folders under ${res.dest}`;
+    if (res.errors.length) msg += `\n${res.errors.length} errors:\n` + res.errors.slice(0, 5).join("\n");
+    $("spStatus").textContent = msg;
+    toast(`${verb} ${res.moved} files`);
+    $("recursive").checked = true;   // sorted files now live in subfolders
+    $("splitModal").classList.add("hidden");
+    reloadFolder();
+  } catch (e) { $("spStatus").textContent = "Error: " + e.message; }
+}
+
+// ---------------------------------------------------------------------------
 // Keyboard
 // ---------------------------------------------------------------------------
 function inField(e) {
@@ -820,8 +1072,18 @@ function inField(e) {
 }
 
 document.addEventListener("keydown", (e) => {
+  // editor undo/redo — handled first so it works even with a slider focused
+  if (S.editor && (e.ctrlKey || e.metaKey)) {
+    const kk = e.key.toLowerCase();
+    if (kk === "z") { e.preventDefault(); e.shiftKey ? redoEdit() : undoEdit(); return; }
+    if (kk === "y") { e.preventDefault(); redoEdit(); return; }
+  }
   // modals
   if (!$("help").classList.contains("hidden") && e.key === "Escape") { $("help").classList.add("hidden"); return; }
+  if (!$("splitModal").classList.contains("hidden")) {
+    if (e.key === "Escape") $("splitModal").classList.add("hidden");
+    return;
+  }
   if (!$("deleteModal").classList.contains("hidden")) {
     if (e.key === "Escape") $("deleteModal").classList.add("hidden");
     return;
@@ -852,6 +1114,10 @@ document.addEventListener("keydown", (e) => {
   if (k >= "1" && k <= "5") { markCurrent({ rating: parseInt(k, 10) }, false); return; }
 
   if (inViewer) {
+    if (S.cropMode) {   // crop drag in progress swallows nav/zoom; Esc cancels it
+      if (k === "escape") exitCropMode();
+      return;
+    }
     if (k === "escape") { closeViewer(); return; }
     if (S.viewer.mode === "tournament") {
       switch (k) {
@@ -927,6 +1193,7 @@ async function runExport() {
   const dest = $("exDest").value.trim();
   if (!dest) { $("exStatus").textContent = "Enter a destination folder."; return; }
   $("exStatus").textContent = "Exporting…";
+  $("exFiles").classList.add("hidden");
   try {
     const res = await post("/api/export", {
       dest,
@@ -934,13 +1201,32 @@ async function runExport() {
       selection: $("exSel").value,
       min_rating: parseInt($("exMin").value, 10),
       keep_structure: $("exStruct").checked,
+      compress: $("exCompress").checked,
+      quality: parseInt($("exQuality").value, 10),
     });
-    let msg = `Exported ${res.exported} files to ${res.dest}`;
-    if (res.errors.length) msg += `\n${res.errors.length} errors:\n` + res.errors.slice(0, 5).join("\n");
+    const verb = res.action === "move" ? "Moved" : "Copied";
+    let msg = `${verb} ${res.exported} files to ${res.dest}`;
+    if (res.errors.length) msg += ` · ${res.errors.length} errors`;
     $("exStatus").textContent = msg;
-    toast(`Exported ${res.exported} files`);
+    renderExFiles(verb, res.files, res.errors);
+    toast(`${verb} ${res.exported} files`);
     reloadFolder();  // rescan disk: reflects moved-out files and any copies in-tree
   } catch (e) { $("exStatus").textContent = "Error: " + e.message; }
+}
+
+// list exactly which files landed (and any per-file errors)
+function renderExFiles(verb, files, errors) {
+  const el = $("exFiles");
+  files = files || []; errors = errors || [];
+  if (!files.length && !errors.length) { el.classList.add("hidden"); el.innerHTML = ""; return; }
+  let h = `<div class="exhead">${verb} ${files.length} file${files.length === 1 ? "" : "s"}:</div>`;
+  h += files.map((f) =>
+    `<div class="exrow"><span class="exname">${f.name}</span>` +
+    (f.compressed ? `<span class="excomp">compressed</span>` : "") +
+    `<span class="expath" title="${f.dest}">${f.dest}</span></div>`).join("");
+  if (errors.length) h += errors.map((e) => `<div class="exrow err">⚠ ${e}</div>`).join("");
+  el.innerHTML = h;
+  el.classList.remove("hidden");
 }
 
 function rejectedCount() { return visiblePhotos().filter((p) => p.flag === -1).length; }
@@ -961,6 +1247,8 @@ function openExport() {
     ? "Move all rejected (X) photos to the Recycle Bin (recoverable)."
     : "Permanently remove all rejected (X) photos from disk (NOT recoverable).";
   $("exStatus").textContent = "";
+  $("exFiles").classList.add("hidden");
+  $("exFiles").innerHTML = "";
   $("exportModal").classList.remove("hidden");
 }
 
@@ -1086,6 +1374,29 @@ $("groupRaw").addEventListener("change", (e) => {
 $("exportBtn").addEventListener("click", openExport);
 $("exCancel").addEventListener("click", () => $("exportModal").classList.add("hidden"));
 $("exRun").addEventListener("click", runExport);
+$("exCompress").addEventListener("change", (e) => {
+  document.querySelector(".exq").classList.toggle("hidden", !e.target.checked);
+});
+
+// ---- editor ----
+$("editBar").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-act]");
+  if (b) editAction(b.dataset.act);
+});
+$("editBar").querySelectorAll("input[data-edit]").forEach((inp) => {
+  inp.addEventListener("input", () => sliderInput(inp));
+  inp.addEventListener("change", () => sliderCommit(inp));
+  inp.addEventListener("dblclick", () => { inp.value = 1; sliderCommit(inp); });
+});
+
+// ---- date split ----
+$("splitBtn").addEventListener("click", openSplit);
+$("spCancel").addEventListener("click", () => $("splitModal").classList.add("hidden"));
+$("spRun").addEventListener("click", runSplit);
+$("spBrowse").addEventListener("click", async () => {
+  const folder = await pickFolder();
+  if (folder) $("spDest").value = folder;
+});
 
 // ---- grid / thumbnail size slider (persisted) ----
 function applyGridSize(px) {

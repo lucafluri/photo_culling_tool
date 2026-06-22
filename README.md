@@ -34,6 +34,12 @@ Suggested shots: the grid view, loupe/full view, and compare mode.
   the whole group, so the two files stay in sync. Toggle with the **group
   RAW+JPG** checkbox.
 - **Loupe view** with scroll-to-zoom and drag-to-pan.
+- **Non-destructive editing** in loupe view: rotate, flip, crop (drag a box),
+  and brightness / contrast / saturation / sharpness sliders. Edits live in an
+  undo/redo history (`Ctrl+Z` / `Ctrl+Y`), are saved per-photo, and show up as a
+  live preview plus a ✎ badge in the grid. Originals on disk are never written,
+  so **Reset** fully reverts — until you export, which bakes the edits into the
+  output (see below).
 - **Compare mode.** Up to 3 images side by side with synchronized zoom and pan:
   zoom one and they all zoom together. Press `S`, `D`, or `F` to keep the best
   and reject the rest in a single tap.
@@ -47,8 +53,15 @@ Suggested shots: the grid view, loupe/full view, and compare mode.
   dialog, no path typing.
 - **Export** copies or moves kept, rejected, or rated photos into a folder
   (defaults to `<photo folder>/cull_output`, optionally preserving subfolder
-  structure). Originals are untouched unless you move. On a move, marks follow the
-  files to their new location and the folder is rescanned.
+  structure). Any edits you made are baked into the exported file (an edited
+  shot exports as a JPEG with the rotate/crop/tone applied); unedited files are
+  copied byte-for-byte. Originals are untouched unless you move. On a move, marks
+  follow the files to their new location and the folder is rescanned. An edited
+  RAW is never destroyed by a move: the baked JPEG is exported but the original
+  RAW is kept in place and the export reports it. Optionally
+  **compress JPEGs** on the way out (re-encode at a chosen quality, EXIF kept).
+- **Date split.** Move (or copy) photos into date-named subfolders by date taken
+  or modified, inside the current folder or a destination you pick.
 - **Delete rejected** opens a review grid of every rejected shot with thumbnails.
   Click any to deselect (keep) it, then delete only what's left highlighted. Goes
   to the Recycle Bin when `send2trash` is installed (recoverable); otherwise it's
@@ -92,6 +105,7 @@ other on the mouse.
 | `R` | Flag **Reject** (auto-advances) |
 | `Q` | Clear flag |
 | `1`-`5` | Star rating · `` ` `` = 0 stars |
+| `Ctrl`+`Z` / `Ctrl`+`Y` | Undo / redo edits (loupe) |
 | `Space` | Add/remove current photo from the compare set (auto-advances) |
 | `C` | Open compare (the compare set, or current + next if none) |
 | `S` `D` `F` | In compare (≤3): keep that image, reject the others, close |
@@ -105,7 +119,9 @@ compare panes), `S`/`F` for prev/next (loupe) or to focus a pane (compare), `Z`
 or double-click to reset zoom. Marking keys work here too. In a ≤3 compare,
 `S`/`D`/`F` pick the keeper; with more than 3 selected, compare becomes a
 left-vs-right tournament: vote `←`/`S` (left) or `→`/`F` (right) until one
-winner remains.
+winner remains. The edit bar is also live in loupe: rotate/flip/crop and the
+tone sliders apply to whichever photo is current, with `Ctrl+Z`/`Ctrl+Y` to
+undo/redo.
 
 **Mouse mode (`B`):** the photo you hover is semi-selected (dashed outline) and
 every hotkey acts on it instead of the keyboard cursor. Hover, tap `E`/`Q`/a

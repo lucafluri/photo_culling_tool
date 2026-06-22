@@ -23,14 +23,14 @@ import threading
 import webbrowser
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageEnhance
 import pillow_heif
 
 pillow_heif.register_heif_opener()
@@ -73,7 +73,7 @@ THUMB_SIZE = 480       # grid thumbnails (long edge, px)
 PREVIEW_SIZE = 2400    # loupe/compare preview (long edge, px)
 
 # Column list returned to the UI; one source so the two photo SELECTs can't drift.
-PHOTO_COLS = "path, filename, folder, flag, rating, mtime, size, taken"
+PHOTO_COLS = "path, filename, folder, flag, rating, mtime, size, taken, edits"
 
 # Flag values: 1 = keep/pick, -1 = reject, 0 = none.
 
@@ -102,7 +102,8 @@ def init_db():
                 size     INTEGER,
                 flag     INTEGER DEFAULT 0,
                 rating   INTEGER DEFAULT 0,
-                taken    REAL
+                taken    REAL,
+                edits    TEXT
             )
             """
         )
@@ -118,6 +119,8 @@ def init_db():
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(photos)").fetchall()]
         if "taken" not in cols:
             conn.execute("ALTER TABLE photos ADD COLUMN taken REAL")
+        if "edits" not in cols:
+            conn.execute("ALTER TABLE photos ADD COLUMN edits TEXT")
 
 
 def set_setting(key, value):
@@ -198,22 +201,125 @@ def capture_time(path, ext):
     return None
 
 
-def _cache_file(path, mtime, size_tag):
-    key = "{}|{}|{}".format(path, mtime, size_tag).encode("utf-8")
+def _compress_jpeg(src, target, quality):
+    """Re-encode a JPEG at `quality`, preserving EXIF/ICC (and thus orientation).
+
+    Pixels are decoded and re-saved (smaller file), but no edits/transpose are
+    applied — same image, lighter.
+    """
+    with Image.open(src) as im:
+        exif = im.info.get("exif")
+        icc = im.info.get("icc_profile")
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        kw = {"quality": quality, "optimize": True}
+        if exif:
+            kw["exif"] = exif
+        if icc:
+            kw["icc_profile"] = icc
+        im.save(target, "JPEG", **kw)
+
+
+def _bake_to_jpeg(src, target, edits, quality):
+    """Render `src` with `edits` baked in and write a JPEG to `target`.
+
+    Pixels are oriented and edited (rotate/flip/crop/tone applied); EXIF is
+    carried over with the orientation tag cleared so viewers don't re-rotate an
+    already-rotated image. Used by export so the exported file matches the
+    edited preview.
+    """
+    img = _load_pil(src)            # oriented RGB, RAW/HEIC handled
+    img = _apply_edits(img, edits)
+    exif = img.getexif()
+    exif.pop(0x0112, None)          # Orientation — already baked into the pixels
+    kw = {"quality": quality, "optimize": True, "exif": exif.tobytes()}
+    icc = img.info.get("icc_profile")
+    if icc:
+        kw["icc_profile"] = icc
+    img.save(target, "JPEG", **kw)
+
+
+def _apply_edits(img, edits):
+    """Apply non-destructive edits (rotate/flip/crop/enhance) to a PIL image.
+
+    `edits` is the dict stored per-photo; falsy = original. Order: orient (90°
+    steps + flips, lossless), then crop (normalized 0..1 of the rotated frame),
+    then tonal enhancements. Crop coords live in the rotated frame so the UI can
+    draw the crop box on the already-rotated preview.
+    """
+    if not edits:
+        return img
+    rot = int(edits.get("rot", 0)) % 360
+    if rot == 90:
+        img = img.transpose(Image.ROTATE_270)   # rot = clockwise degrees
+    elif rot == 180:
+        img = img.transpose(Image.ROTATE_180)
+    elif rot == 270:
+        img = img.transpose(Image.ROTATE_90)
+    if edits.get("flipH"):
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+    if edits.get("flipV"):
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+    crop = edits.get("crop")
+    if crop and len(crop) == 4:
+        w, h = img.size
+        l, t, r, b = crop
+        box = (int(l * w), int(t * h), int(r * w), int(b * h))
+        if box[2] > box[0] and box[3] > box[1]:
+            img = img.crop(box)
+    for key, Enh in (("bright", ImageEnhance.Brightness),
+                     ("contrast", ImageEnhance.Contrast),
+                     ("saturation", ImageEnhance.Color),
+                     ("sharpness", ImageEnhance.Sharpness)):
+        v = edits.get(key)
+        if v is not None and float(v) != 1.0:
+            img = Enh(img).enhance(float(v))
+    return img
+
+
+def _edits_tag(edits):
+    if not edits:
+        return ""
+    return hashlib.md5(json.dumps(edits, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+
+def get_edits(path):
+    with db() as conn:
+        row = conn.execute("SELECT edits FROM photos WHERE path=?", (path,)).fetchone()
+    if row and row["edits"]:
+        try:
+            return json.loads(row["edits"])
+        except Exception:
+            return None
+    return None
+
+
+def _cache_file(path, mtime, size_tag, edits_tag=""):
+    key = "{}|{}|{}|{}".format(path, mtime, size_tag, edits_tag).encode("utf-8")
     h = hashlib.md5(key).hexdigest()
     return CACHE_DIR / "{}_{}.jpg".format(size_tag, h)
 
 
-def get_rendered(path, long_edge, size_tag):
-    """Generate (or fetch from cache) a JPEG resized to `long_edge`. Returns Path."""
+_NO_EDITS = object()   # sentinel: "look up stored edits" vs an explicit (maybe {}) override
+
+
+def get_rendered(path, long_edge, size_tag, edits=_NO_EDITS):
+    """Generate (or fetch from cache) a JPEG resized to `long_edge`. Returns Path.
+
+    Pass `edits` explicitly (incl. {} for original) to render a live editor
+    preview; omit it to use the photo's stored edits.
+    """
     try:
         st = os.stat(path)
     except OSError:
         raise HTTPException(status_code=404, detail="file not found")
-    out = _cache_file(path, st.st_mtime, size_tag)
+    if edits is _NO_EDITS:
+        edits = get_edits(path)
+    out = _cache_file(path, st.st_mtime, size_tag, _edits_tag(edits))
     if out.exists():
         return out
     img = _load_pil(path)
+    img = _apply_edits(img, edits)
     img.thumbnail((long_edge, long_edge), Image.LANCZOS)
     img.save(out, "JPEG", quality=86, optimize=True)
     return out
@@ -318,12 +424,26 @@ class DeleteReq(BaseModel):
     paths: List[str] = None    # explicit subset to delete; None = all rejected
 
 
+class EditReq(BaseModel):
+    path: str
+    edits: Optional[dict] = None   # None/{} = revert to original
+
+
+class SplitReq(BaseModel):
+    granularity: str = "day"        # day | month | year
+    source: str = "taken"           # taken (EXIF, fallback mtime) | mtime
+    action: str = "move"            # move | copy
+    dest: Optional[str] = None      # None = subfolders inside the current folder
+
+
 class ExportReq(BaseModel):
     dest: str
     action: str = "copy"        # "copy" | "move"
     selection: str = "keep"     # "keep" | "reject" | "rated"
     min_rating: int = 1         # used when selection == "rated"
     keep_structure: bool = False
+    compress: bool = False      # re-encode JPEGs to shrink them
+    quality: int = 85           # JPEG quality when compress is on
 
 
 # ----------------------------------------------------------------------------
@@ -415,9 +535,86 @@ def api_thumb(path: str = Query(...)):
 
 
 @app.get("/api/preview")
-def api_preview(path: str = Query(...)):
-    f = get_rendered(path, PREVIEW_SIZE, "preview")
+def api_preview(path: str = Query(...), edits: str = Query(None)):
+    # `edits` (JSON) overrides stored edits for live editor previews; absent =
+    # use the photo's stored edits.
+    if edits is not None:
+        try:
+            e = json.loads(edits)
+        except Exception:
+            e = {}
+        f = get_rendered(path, PREVIEW_SIZE, "preview", edits=e)
+    else:
+        f = get_rendered(path, PREVIEW_SIZE, "preview")
     return FileResponse(f, media_type="image/jpeg")
+
+
+@app.post("/api/edit")
+def api_edit(req: EditReq):
+    val = json.dumps(req.edits) if req.edits else None
+    with _db_lock, db() as conn:
+        cur = conn.execute("UPDATE photos SET edits=? WHERE path=?", (val, req.path))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="unknown path")
+    return {"ok": True, "path": req.path, "edits": req.edits}
+
+
+@app.post("/api/split-by-date")
+def api_split(req: SplitReq):
+    folder = get_setting("last_folder")
+    if not folder or not os.path.isdir(folder):
+        raise HTTPException(status_code=400, detail="no folder open")
+    folder = os.path.abspath(folder)
+    dest_root = os.path.abspath(req.dest) if req.dest else folder
+    fmt = {"day": "%Y-%m-%d", "month": "%Y-%m", "year": "%Y"}.get(req.granularity)
+    if not fmt:
+        raise HTTPException(status_code=400, detail="bad granularity")
+
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT {PHOTO_COLS} FROM photos WHERE folder=?", (folder,)
+        ).fetchall()
+
+    done = 0
+    errors = []
+    moved = []   # (old, new) for DB path fixups after a move
+    for r in rows:
+        src = r["path"]
+        if not os.path.isfile(src):
+            errors.append("missing: " + src)
+            continue
+        ts = r["taken"] if (req.source == "taken" and r["taken"]) else r["mtime"]
+        sub = datetime.fromtimestamp(ts or 0).strftime(fmt)
+        tdir = os.path.join(dest_root, sub)
+        os.makedirs(tdir, exist_ok=True)
+        target = os.path.join(tdir, os.path.basename(src))
+        if os.path.abspath(target) == os.path.abspath(src):
+            continue  # already in place
+        base, ext = os.path.splitext(target)
+        n = 1
+        while os.path.exists(target):
+            target = "{}_{}{}".format(base, n, ext)
+            n += 1
+        try:
+            if req.action == "move":
+                shutil.move(src, target)
+                moved.append((src, os.path.abspath(target)))
+            else:
+                shutil.copy2(src, target)
+            done += 1
+        except Exception as e:  # noqa
+            errors.append("{}: {}".format(src, e))
+
+    if moved:
+        with _db_lock, db() as conn:
+            for old, new in moved:
+                conn.execute("DELETE FROM photos WHERE path=?", (new,))
+                conn.execute(
+                    "UPDATE photos SET path=?, folder=?, filename=? WHERE path=?",
+                    (new, os.path.dirname(new), os.path.basename(new), old),
+                )
+
+    return {"moved": done, "action": req.action, "dest": dest_root, "errors": errors}
 
 
 @app.post("/api/mark")
@@ -451,32 +648,56 @@ def api_export(req: ExportReq):
     dest = os.path.abspath(req.dest)
     os.makedirs(dest, exist_ok=True)
 
+    # only ever act on the currently-open folder, never photos left in the DB
+    # from previously-scanned folders
+    folder = get_setting("last_folder")
+    folder = os.path.abspath(folder) if folder else None
     with db() as conn:
         if req.selection == "keep":
-            rows = conn.execute("SELECT * FROM photos WHERE flag=1").fetchall()
+            rows = conn.execute(
+                "SELECT * FROM photos WHERE flag=1 AND folder=?", (folder,)).fetchall()
         elif req.selection == "reject":
-            rows = conn.execute("SELECT * FROM photos WHERE flag=-1").fetchall()
+            rows = conn.execute(
+                "SELECT * FROM photos WHERE flag=-1 AND folder=?", (folder,)).fetchall()
         elif req.selection == "rated":
             rows = conn.execute(
-                "SELECT * FROM photos WHERE rating>=?", (int(req.min_rating),)
-            ).fetchall()
+                "SELECT * FROM photos WHERE rating>=? AND folder=?",
+                (int(req.min_rating), folder)).fetchall()
         else:
             raise HTTPException(status_code=400, detail="bad selection")
 
+    quality = max(1, min(100, int(req.quality)))
     done = 0
     errors = []
+    files = []   # what actually landed, for the UI to show
     moved = []   # (old_path, new_path) for DB path fixups after a move
+    baked = set()  # new paths whose edits are now baked in (clear edits on fixup)
     for r in rows:
         src = r["path"]
         if not os.path.isfile(src):
             errors.append("missing: " + src)
             continue
+        try:
+            edits = json.loads(r["edits"]) if r["edits"] else None
+        except (TypeError, ValueError):
+            edits = None
+        src_ext = os.path.splitext(src)[1].lower()
+        is_jpeg = src_ext in {".jpg", ".jpeg"}
+        do_compress = req.compress and is_jpeg
+        bake = bool(edits)                  # render the edits into the exported file
+        # Guard: a baked move of a RAW would delete the irreplaceable original and
+        # leave only a JPEG. Keep the RAW (export the baked JPEG as a copy) and warn.
+        keep_raw = bake and req.action == "move" and src_ext in RAW_EXTS
+        # a baked file is always a JPEG, so a non-JPEG source changes extension
+        name = os.path.basename(src)
+        if bake and not is_jpeg:
+            name = os.path.splitext(name)[0] + ".jpg"
         if req.keep_structure:
-            rel = os.path.relpath(src, r["folder"])
+            rel = os.path.join(os.path.dirname(os.path.relpath(src, r["folder"])), name)
             target = os.path.join(dest, rel)
             os.makedirs(os.path.dirname(target), exist_ok=True)
         else:
-            target = os.path.join(dest, os.path.basename(src))
+            target = os.path.join(dest, name)
             # avoid clobbering same-named files
             base, ext = os.path.splitext(target)
             n = 1
@@ -484,11 +705,27 @@ def api_export(req: ExportReq):
                 target = "{}_{}{}".format(base, n, ext)
                 n += 1
         try:
-            if req.action == "move":
+            if bake:
+                _bake_to_jpeg(src, target, edits, quality if do_compress else 92)
+                if keep_raw:
+                    errors.append("kept RAW (a move would destroy it): " + src)
+                elif req.action == "move":
+                    os.remove(src)
+                    moved.append((src, os.path.abspath(target)))
+                    baked.add(os.path.abspath(target))
+            elif do_compress:
+                _compress_jpeg(src, target, quality)
+                if req.action == "move":
+                    os.remove(src)
+                    moved.append((src, os.path.abspath(target)))
+            elif req.action == "move":
                 shutil.move(src, target)
                 moved.append((src, os.path.abspath(target)))
             else:
                 shutil.copy2(src, target)
+            files.append({"name": os.path.basename(target),
+                          "dest": os.path.abspath(target),
+                          "compressed": do_compress or bake})
             done += 1
         except Exception as e:  # noqa
             errors.append("{}: {}".format(src, e))
@@ -503,14 +740,21 @@ def api_export(req: ExportReq):
                     "UPDATE photos SET path=?, folder=?, filename=? WHERE path=?",
                     (new, os.path.dirname(new), os.path.basename(new), old),
                 )
+                if new in baked:   # edits are baked into the moved file now
+                    conn.execute("UPDATE photos SET edits=NULL WHERE path=?", (new,))
 
-    return {"exported": done, "dest": dest, "errors": errors}
+    return {"exported": done, "dest": dest, "action": req.action,
+            "files": files, "errors": errors}
 
 
 @app.post("/api/delete-rejected")
 def api_delete_rejected(req: DeleteReq):
+    # scope to the open folder so stale rejects from past folders are untouched
+    folder = get_setting("last_folder")
+    folder = os.path.abspath(folder) if folder else None
     with db() as conn:
-        rows = conn.execute("SELECT path FROM photos WHERE flag=-1").fetchall()
+        rows = conn.execute(
+            "SELECT path FROM photos WHERE flag=-1 AND folder=?", (folder,)).fetchall()
     rejected = [r["path"] for r in rows]
     if req.paths is not None:
         # only ever delete files that are actually flagged reject, even if the
