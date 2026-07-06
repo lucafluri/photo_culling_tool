@@ -16,11 +16,13 @@ import os
 import io
 import sys
 import json
+import math
 import hashlib
 import shutil
 import sqlite3
 import threading
 import webbrowser
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -239,13 +241,33 @@ def _bake_to_jpeg(src, target, edits, quality):
     img.save(target, "JPEG", **kw)
 
 
+def _max_inscribed(w, h, angle):
+    """Largest axis-aligned rectangle inside a w×h rect rotated by `angle` (rad)."""
+    if w <= 0 or h <= 0:
+        return 0.0, 0.0
+    width_is_longer = w >= h
+    side_long, side_short = (w, h) if width_is_longer else (h, w)
+    sin_a, cos_a = abs(math.sin(angle)), abs(math.cos(angle))
+    if side_short <= 2.0 * sin_a * cos_a * side_long or abs(sin_a - cos_a) < 1e-10:
+        # half-constrained case: two crop corners touch the long side
+        x = 0.5 * side_short
+        wr, hr = (x / sin_a, x / cos_a) if width_is_longer else (x / cos_a, x / sin_a)
+    else:
+        cos_2a = cos_a * cos_a - sin_a * sin_a
+        wr = (w * cos_a - h * sin_a) / cos_2a
+        hr = (h * cos_a - w * sin_a) / cos_2a
+    return wr, hr
+
+
 def _apply_edits(img, edits):
-    """Apply non-destructive edits (rotate/flip/crop/enhance) to a PIL image.
+    """Apply non-destructive edits (rotate/flip/crop/enhance/border) to a PIL image.
 
     `edits` is the dict stored per-photo; falsy = original. Order: orient (90°
-    steps + flips, lossless), then crop (normalized 0..1 of the rotated frame),
-    then tonal enhancements. Crop coords live in the rotated frame so the UI can
-    draw the crop box on the already-rotated preview.
+    steps + flips, lossless), fine rotation (straighten, auto-cropped to the
+    largest inscribed rect), then crop (normalized 0..1 of the rotated frame),
+    then tonal enhancements, then border (last, so its color is exact). Crop
+    coords live in the rotated frame so the UI can draw the crop box on the
+    already-rotated preview.
     """
     if not edits:
         return img
@@ -260,6 +282,17 @@ def _apply_edits(img, edits):
         img = img.transpose(Image.FLIP_LEFT_RIGHT)
     if edits.get("flipV"):
         img = img.transpose(Image.FLIP_TOP_BOTTOM)
+    fine = float(edits.get("fine", 0) or 0)
+    if fine:
+        w, h = img.size
+        img = img.rotate(-fine, resample=Image.BICUBIC, expand=True)  # positive = CW
+        wr, hr = _max_inscribed(w, h, math.radians(fine))
+        W, H = img.size
+        l = max(0, int((W - wr) / 2))
+        t = max(0, int((H - hr) / 2))
+        box = (l, t, min(W, int(l + wr)), min(H, int(t + hr)))
+        if box[2] > box[0] and box[3] > box[1]:
+            img = img.crop(box)
     crop = edits.get("crop")
     if crop and len(crop) == 4:
         w, h = img.size
@@ -267,6 +300,26 @@ def _apply_edits(img, edits):
         box = (int(l * w), int(t * h), int(r * w), int(b * h))
         if box[2] > box[0] and box[3] > box[1]:
             img = img.crop(box)
+    if edits.get("auto"):
+        # auto-levels: stretch the histogram, clipping 1% outliers per channel
+        img = ImageOps.autocontrast(img, cutoff=1)
+    # full white balance: independent +/- gain on red and blue. `temp` is the
+    # older single-axis control (kept so photos edited before the R/B split
+    # still render the same) — it nudges both channels oppositely, as before;
+    # wbR/wbB move independently on top of that.
+    temp = float(edits.get("temp", 0) or 0)
+    wb_r = float(edits.get("wbR", 0) or 0)
+    wb_b = float(edits.get("wbB", 0) or 0)
+    if temp or wb_r or wb_b:
+        r_gain = 1 + 0.3 * (temp + wb_r)
+        b_gain = 1 + 0.3 * (-temp + wb_b)
+        if r_gain != 1 or b_gain != 1:
+            r, g, b = img.split()
+            if r_gain != 1:
+                r = r.point(lambda v: min(255, int(v * r_gain)))
+            if b_gain != 1:
+                b = b.point(lambda v: min(255, int(v * b_gain)))
+            img = Image.merge("RGB", (r, g, b))
     for key, Enh in (("bright", ImageEnhance.Brightness),
                      ("contrast", ImageEnhance.Contrast),
                      ("saturation", ImageEnhance.Color),
@@ -274,6 +327,13 @@ def _apply_edits(img, edits):
         v = edits.get(key)
         if v is not None and float(v) != 1.0:
             img = Enh(img).enhance(float(v))
+    b = edits.get("border")
+    if b and b.get("w"):
+        # width is a fraction of the short edge, so previews and full-size
+        # exports get the same visual proportion
+        px = int(round(float(b["w"]) * min(img.size)))
+        if px > 0:
+            img = ImageOps.expand(img, border=px, fill=b.get("color", "#ffffff"))
     return img
 
 
@@ -302,6 +362,26 @@ def _cache_file(path, mtime, size_tag, edits_tag=""):
 
 _NO_EDITS = object()   # sentinel: "look up stored edits" vs an explicit (maybe {}) override
 
+# RAM cache of un-edited preview-size base images, so live editor renders skip
+# the expensive full-res decode and land fast enough to feel instant.
+_base_lock = threading.Lock()
+_base_cache = OrderedDict()   # path -> (mtime, PIL image at PREVIEW_SIZE)
+
+
+def _preview_base(path, mtime):
+    with _base_lock:
+        v = _base_cache.get(path)
+        if v and v[0] == mtime:
+            _base_cache.move_to_end(path)
+            return v[1]
+    img = _load_pil(path)
+    img.thumbnail((PREVIEW_SIZE, PREVIEW_SIZE), Image.LANCZOS)
+    with _base_lock:
+        _base_cache[path] = (mtime, img)
+        while len(_base_cache) > 4:
+            _base_cache.popitem(last=False)
+    return img
+
 
 def get_rendered(path, long_edge, size_tag, edits=_NO_EDITS):
     """Generate (or fetch from cache) a JPEG resized to `long_edge`. Returns Path.
@@ -313,10 +393,18 @@ def get_rendered(path, long_edge, size_tag, edits=_NO_EDITS):
         st = os.stat(path)
     except OSError:
         raise HTTPException(status_code=404, detail="file not found")
-    if edits is _NO_EDITS:
+    live = edits is not _NO_EDITS
+    if not live:
         edits = get_edits(path)
     out = _cache_file(path, st.st_mtime, size_tag, _edits_tag(edits))
     if out.exists():
+        return out
+    if live and size_tag == "preview":
+        # ponytail: live editor renders edit a RAM-cached 2400px base and skip
+        # `optimize` — a heavy crop previews below full detail until the stored
+        # render (full-res path below) replaces it after commit/navigation
+        img = _apply_edits(_preview_base(path, st.st_mtime), edits)
+        img.save(out, "JPEG", quality=86)
         return out
     img = _load_pil(path)
     img = _apply_edits(img, edits)
@@ -427,6 +515,10 @@ class DeleteReq(BaseModel):
 class EditReq(BaseModel):
     path: str
     edits: Optional[dict] = None   # None/{} = revert to original
+
+
+class SaveCopyReq(BaseModel):
+    path: str
 
 
 class SplitReq(BaseModel):
@@ -549,6 +641,64 @@ def api_preview(path: str = Query(...), edits: str = Query(None)):
     return FileResponse(f, media_type="image/jpeg")
 
 
+def _ratio(v):
+    """EXIF rationals arrive as IFDRational or as a (num, den) tuple."""
+    if isinstance(v, tuple) and len(v) == 2:
+        return v[0] / v[1] if v[1] else 0.0
+    return float(v)
+
+
+def _fmt_shutter(v):
+    v = _ratio(v)
+    if v <= 0:
+        return None
+    return "1/{:.0f}s".format(round(1 / v)) if v < 1 else "{:g}s".format(v)
+
+
+@app.get("/api/meta")
+def api_meta(path: str = Query(...)):
+    """Best-effort shooting info (EXIF) for the loupe info panel.
+
+    Anything unreadable is simply null — RAW support depends on how much of the
+    TIFF container Pillow can parse.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        raise HTTPException(status_code=404, detail="file not found")
+    out = {"size": st.st_size, "width": None, "height": None, "camera": None,
+           "lens": None, "shutter": None, "aperture": None, "iso": None,
+           "focal": None}
+    try:
+        with Image.open(path) as img:
+            out["width"], out["height"] = img.size
+            exif = img.getexif()
+            make = str(exif.get(271, "")).strip()
+            model = str(exif.get(272, "")).strip()
+            if model:
+                # many models already embed the make ("Canon EOS R5")
+                dup = make and make.split(" ")[0].lower() in model.lower()
+                out["camera"] = model if dup else (make + " " + model).strip()
+            try:
+                sub = exif.get_ifd(0x8769) or {}
+            except Exception:
+                sub = {}
+            if sub.get(42036):
+                out["lens"] = str(sub[42036]).strip()
+            if sub.get(33434):
+                out["shutter"] = _fmt_shutter(sub[33434])
+            if sub.get(33437):
+                out["aperture"] = "f/{:g}".format(_ratio(sub[33437]))
+            iso = sub.get(34855)
+            if iso:
+                out["iso"] = "ISO {}".format(int(iso[0]) if isinstance(iso, (list, tuple)) else int(iso))
+            if sub.get(37386):
+                out["focal"] = "{:g}mm".format(_ratio(sub[37386]))
+    except Exception:
+        pass
+    return out
+
+
 @app.post("/api/edit")
 def api_edit(req: EditReq):
     val = json.dumps(req.edits) if req.edits else None
@@ -557,6 +707,56 @@ def api_edit(req: EditReq):
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="unknown path")
     return {"ok": True, "path": req.path, "edits": req.edits}
+
+
+@app.post("/api/save-copy")
+def api_save_copy(req: SaveCopyReq):
+    """Bake a photo's edits into a new JPEG next to the original.
+
+    The original is untouched; the copy is registered in the DB (same scan
+    folder, no edits of its own) so it appears in the library immediately.
+    """
+    with db() as conn:
+        row = conn.execute(
+            f"SELECT {PHOTO_COLS} FROM photos WHERE path=?", (req.path,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="unknown path")
+    if not os.path.isfile(req.path):
+        raise HTTPException(status_code=404, detail="file not found")
+    try:
+        edits = json.loads(row["edits"]) if row["edits"] else None
+    except (TypeError, ValueError):
+        edits = None
+    if not edits:
+        raise HTTPException(status_code=400, detail="photo has no edits")
+
+    d = os.path.dirname(req.path)
+    base = os.path.splitext(os.path.basename(req.path))[0]
+    target = os.path.join(d, base + "_edited.jpg")
+    n = 1
+    while os.path.exists(target):
+        target = os.path.join(d, "{}_edited_{}.jpg".format(base, n))
+        n += 1
+    _bake_to_jpeg(req.path, target, edits, 92)
+
+    target = os.path.abspath(target)
+    st = os.stat(target)
+    with _db_lock, db() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO photos(path, folder, filename, mtime, size,
+                                          flag, rating, taken, edits)
+            VALUES(?, ?, ?, ?, ?, 0, 0, ?, NULL)
+            """,
+            (target, row["folder"], os.path.basename(target),
+             st.st_mtime, st.st_size, row["taken"]),
+        )
+    with db() as conn:
+        new = conn.execute(
+            f"SELECT {PHOTO_COLS} FROM photos WHERE path=?", (target,)
+        ).fetchone()
+    return {"ok": True, "photo": dict(new)}
 
 
 @app.post("/api/split-by-date")

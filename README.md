@@ -34,12 +34,26 @@ Suggested shots: the grid view, loupe/full view, and compare mode.
   the whole group, so the two files stay in sync. Toggle with the **group
   RAW+JPG** checkbox.
 - **Loupe view** with scroll-to-zoom and drag-to-pan.
-- **Non-destructive editing** in loupe view: rotate, flip, crop (drag a box),
-  and brightness / contrast / saturation / sharpness sliders. Edits live in an
-  undo/redo history (`Ctrl+Z` / `Ctrl+Y`), are saved per-photo, and show up as a
-  live preview plus a ✎ badge in the grid. Originals on disk are never written,
-  so **Reset** fully reverts — until you export, which bakes the edits into the
-  output (see below).
+- **Non-destructive editing** in loupe view: rotate, straighten (fine angle,
+  auto-cropped), flip, crop (`C`, drag a box), auto-levels, white balance,
+  a solid border (width + color), and brightness / contrast / saturation /
+  sharpness sliders — each slider has a numeric field for exact values. Every
+  slider previews **live while dragging** (tone via CSS/SVG filters that match
+  the server math, straighten via a live rotate-and-zoom, border via a live
+  overlay), and the exact server render settles in on release. Edits
+  live in a per-photo undo/redo history (`Ctrl+Z` / `Ctrl+Y`), are saved to
+  the DB, and show up as a live preview plus a ✎ badge in the grid.
+  `Ctrl+C` / `Ctrl+V` copies the whole edit stack onto another photo. Press
+  `O` to flip between original and edited, `I` for an EXIF info panel
+  (camera, lens, shutter, aperture, ISO). Originals on disk are never
+  written, so **Reset** fully reverts — until you export, which bakes the
+  edits into the output (see below). **💾 Save copy** writes the edited
+  version as a new JPEG next to the original (`_edited.jpg`) and adds it to
+  the library.
+- **Mark undo.** `U` reverts the last flag/rating change — including a whole
+  compare/tournament verdict in one step.
+- **Progress counter.** The header shows how many photos are still unflagged
+  ("N to cull"), so you always know how far you are.
 - **Compare mode.** Up to 3 images side by side with synchronized zoom and pan:
   zoom one and they all zoom together. Press `S`, `D`, or `F` to keep the best
   and reject the rest in a single tap.
@@ -105,7 +119,10 @@ other on the mouse.
 | `R` | Flag **Reject** (auto-advances) |
 | `Q` | Clear flag |
 | `1`-`5` | Star rating · `` ` `` = 0 stars |
+| `U` | Undo last mark (flag/rating) |
 | `Ctrl`+`Z` / `Ctrl`+`Y` | Undo / redo edits (loupe) |
+| `Ctrl`+`C` / `Ctrl`+`V` | Copy / paste edits between photos (loupe) |
+| `I` | EXIF info panel (loupe) |
 | `Space` | Add/remove current photo from the compare set (auto-advances) |
 | `C` | Open compare (the compare set, or current + next if none) |
 | `S` `D` `F` | In compare (≤3): keep that image, reject the others, close |
@@ -119,9 +136,9 @@ compare panes), `S`/`F` for prev/next (loupe) or to focus a pane (compare), `Z`
 or double-click to reset zoom. Marking keys work here too. In a ≤3 compare,
 `S`/`D`/`F` pick the keeper; with more than 3 selected, compare becomes a
 left-vs-right tournament: vote `←`/`S` (left) or `→`/`F` (right) until one
-winner remains. The edit bar is also live in loupe: rotate/flip/crop and the
-tone sliders apply to whichever photo is current, with `Ctrl+Z`/`Ctrl+Y` to
-undo/redo.
+winner remains. The edit bar is also live in loupe: rotate, straighten, flip,
+crop (`C`), border, and the tone sliders apply to whichever photo is current,
+with `Ctrl+Z`/`Ctrl+Y` to undo/redo and `O` to peek at the original.
 
 **Mouse mode (`B`):** the photo you hover is semi-selected (dashed outline) and
 every hotkey acts on it instead of the keyboard cursor. Hover, tap `E`/`Q`/a

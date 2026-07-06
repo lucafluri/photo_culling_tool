@@ -19,8 +19,11 @@ const S = {
   mouseMode: false,    // hotkeys act on the hovered photo
   hover: null,         // hovered grid index (mouse mode)
   groupRaw: true,      // combine same-named RAW + JPEG into one item
-  editor: null,        // null | {path, hist:[edits...], idx} — active loupe editor
+  editor: null,        // null | {path, showOrig} — active loupe editor
   cropMode: false,     // drawing a crop box
+  showMeta: true,      // EXIF info panel visible in loupe (default on)
+  showGrid: true,      // alignment grid overlay in edit mode (default on)
+  showHist: true,      // RGB histogram panel visible in loupe (default on)
 };
 
 const $ = (id) => document.getElementById(id);
@@ -300,9 +303,12 @@ function updateCounts() {
     else if (p.flag === -1) reject++;
     if (p.rating > 0) rated++;
   }
+  const left = vis.length - keep - reject;
   $("counts").innerHTML =
     `<b>${vis.length}</b> photos · <b style="color:var(--keep)">${keep}</b> keep · ` +
-    `<b style="color:var(--reject)">${reject}</b> reject · <b>${rated}</b> rated` +
+    `<b style="color:var(--reject)">${reject}</b> reject · ` +
+    (left || !vis.length ? `<b>${left}</b> to cull · ` : `<b style="color:var(--keep)">done</b> · `) +
+    `<b>${rated}</b> rated` +
     (S.compare.length ? ` · <b style="color:var(--star)">${S.compare.length}</b> compare` : "");
 }
 
@@ -394,6 +400,12 @@ function refreshCell(i) {
   const cmpIdx = S.compare.indexOf(p.path);
   if (cmpIdx >= 0) cell.classList.add("cmp");
   cell.querySelector(".stars").textContent = starStr(p.rating);
+  let eb = cell.querySelector(".editbadge");
+  if (p.edits && !eb) {
+    eb = document.createElement("div");
+    eb.className = "editbadge"; eb.title = "Edited"; eb.textContent = "✎";
+    cell.appendChild(eb);
+  } else if (!p.edits && eb) { eb.remove(); }
   let num = cell.querySelector(".cmpnum");
   if (cmpIdx >= 0) {
     if (!num) { num = document.createElement("div"); num.className = "cmpnum"; cell.appendChild(num); }
@@ -457,9 +469,49 @@ function toggleMouseMode(on) {
 // ---------------------------------------------------------------------------
 // Marking
 // ---------------------------------------------------------------------------
-async function mark(path, fields) {
+// Undo stack for flag/rating changes: each entry is one user action — a list
+// of {path, flag, rating} snapshots taken BEFORE the change. U restores one.
+const markHist = [];
+function snapshotMarks(paths) {
+  const seen = new Set();
+  const items = [];
+  for (const pp of paths) {
+    const p = S.byPath.get(pp);
+    if (!p) continue;
+    for (const tp of (p.members && p.members.length ? p.members : [pp])) {
+      if (seen.has(tp)) continue;
+      seen.add(tp);
+      const t = S.byPath.get(tp);
+      if (t) items.push({ path: tp, flag: t.flag, rating: t.rating });
+    }
+  }
+  if (items.length) {
+    markHist.push(items);
+    if (markHist.length > 100) markHist.shift();
+  }
+}
+
+function undoMark() {
+  const last = markHist.pop();
+  if (!last) { toast("Nothing to undo"); return; }
+  for (const it of last) {
+    const t = S.byPath.get(it.path);
+    if (!t) continue;
+    t.flag = it.flag; t.rating = it.rating;
+    const vi = S.view.indexOf(t);
+    if (vi >= 0) refreshCell(vi);
+    post("/api/mark", { path: it.path, flag: it.flag, rating: it.rating })
+      .catch((e) => toast("Save failed: " + e.message));
+  }
+  updateCounts();
+  if (S.viewer) renderViewerMeta();
+  toast("Mark undone");
+}
+
+async function mark(path, fields, record = true) {
   const p = S.byPath.get(path);
   if (!p) return;
+  if (record) snapshotMarks([path]);
   // a grouped primary carries its member paths; mark them all so the RAW and
   // the JPEG stay in lock-step (and the server's flag-based ops hit both)
   const targets = (p.members && p.members.length) ? p.members : [path];
@@ -524,6 +576,7 @@ function toggleCompare(path) {
   // renumber others
   S.view.forEach((p, idx) => { if (S.compare.includes(p.path)) refreshCell(idx); });
   updateCounts();
+  updatePasteBtn();
 }
 
 // ---------------------------------------------------------------------------
@@ -546,13 +599,15 @@ function clearCompare(msg) {
   const sy = grid.scrollTop;
   applyFilter();
   grid.scrollTop = sy;
+  updatePasteBtn();
   if (msg) toast(msg);
 }
 
 // Finish a comparison: keep `winner`, reject everyone else in `contenders`,
 // clear the compare set, close the viewer.
 function finishCompare(winner, contenders) {
-  contenders.forEach((path) => mark(path, { flag: path === winner ? 1 : -1 }));
+  snapshotMarks(contenders);   // one undo entry for the whole verdict
+  contenders.forEach((path) => mark(path, { flag: path === winner ? 1 : -1 }, false));
   const w = S.byPath.get(winner);
   toast("Best: " + (w ? w.filename : "?") + " · rejected the other " + (contenders.length - 1));
   closeViewer();
@@ -642,7 +697,7 @@ function buildPanes() {
     const img = document.createElement("img");
     img.src = previewUrl(path);
     img.draggable = false;
-    img.onload = () => { computeFit(idx, pane, img); applyTransform(); };
+    img.onload = () => { computeFit(idx, pane, img); applyTransform(); drawHistogram(); };
     const label = document.createElement("div");
     label.className = "plabel";
     pane.appendChild(label);
@@ -678,10 +733,18 @@ function buildPanes() {
   // editor is ambient in loupe (single image), hidden in compare/tournament
   if (S.viewer.mode === "loupe") {
     bindEditor(S.viewer.paths[S.viewer.cur]);
+    if (S.showMeta) renderMeta(); else $("metaPanel").classList.add("hidden");
+    preloadNeighbors();
+    drawHistogram();
   } else {
     S.editor = null;
     $("editBar").classList.add("hidden");
+    $("metaPanel").classList.add("hidden");
+    $("histPanel").classList.add("hidden");
   }
+  // the sidebar just appeared/disappeared, changing the pane's available
+  // width before any image has necessarily loaded — refit defensively
+  refitPanes();
   renderViewerMeta();
 }
 
@@ -692,6 +755,21 @@ function computeFit(idx, pane, img) {
   S.viewer._fit[idx] = { fit: Math.min(PW / nw, PH / nh), nw, nh, PW, PH };
 }
 
+// JS twin of the server's _max_inscribed: largest axis-aligned rect inside a
+// w×h rect rotated by `deg`. Used to zoom the live straighten preview so it
+// shows the same framing the server will crop to.
+function maxInscribed(w, h, deg) {
+  const a = Math.abs(deg) * Math.PI / 180;
+  const sin = Math.sin(a), cos = Math.cos(a);
+  const longS = Math.max(w, h), shortS = Math.min(w, h);
+  if (shortS <= 2 * sin * cos * longS || Math.abs(sin - cos) < 1e-10) {
+    const x = 0.5 * shortS;
+    return w >= h ? [x / sin, x / cos] : [x / cos, x / sin];
+  }
+  const cos2 = cos * cos - sin * sin;
+  return [(w * cos - h * sin) / cos2, (h * cos - w * sin) / cos2];
+}
+
 function applyTransform() {
   const v = S.viewer;
   if (!v) return;
@@ -700,12 +778,19 @@ function applyTransform() {
     const f = v._fit[idx];
     const img = pane._img;
     if (!f) continue;
-    const scale = f.fit * v.zoom;
+    let scale = f.fit * v.zoom;
     const cx = f.PW / 2 + v.panx;
     const cy = f.PH / 2 + v.pany;
-    const left = cx - (f.nw / 2) * scale;
-    const top = cy - (f.nh / 2) * scale;
-    img.style.transform = `translate(${left}px, ${top}px) scale(${scale})`;
+    let rot = "";
+    // live straighten: rotate + zoom to the inscribed rect while dragging
+    const lf = (idx === 0 && S.editor && S.editor.liveFine) ? S.editor.liveFine : 0;
+    if (lf) {
+      const [wr, hr] = maxInscribed(f.nw, f.nh, lf);
+      scale = v.zoom * Math.min(f.PW / wr, f.PH / hr);
+      rot = ` rotate(${lf}deg)`;
+    }
+    img.style.transform =
+      `translate(${cx}px, ${cy}px)${rot} scale(${scale}) translate(${-f.nw / 2}px, ${-f.nh / 2}px)`;
   }
 }
 
@@ -736,6 +821,20 @@ function resetZoom() {
   applyTransform(); updateHud();
 }
 
+// One window-level drag handler for all panes (panes are rebuilt constantly;
+// per-pane window listeners would pile up and never be removed).
+let paneDrag = null;   // {pane, lx, ly} while the mouse is panning a pane
+window.addEventListener("mousemove", (e) => {
+  if (!paneDrag || !S.viewer) return;
+  S.viewer.panx += e.clientX - paneDrag.lx;
+  S.viewer.pany += e.clientY - paneDrag.ly;
+  paneDrag.lx = e.clientX; paneDrag.ly = e.clientY;
+  applyTransform();
+});
+window.addEventListener("mouseup", () => {
+  if (paneDrag) { paneDrag.pane.classList.remove("grabbing"); paneDrag = null; }
+});
+
 function attachPaneHandlers(pane, idx) {
   pane.addEventListener("wheel", (e) => {
     e.preventDefault();
@@ -745,20 +844,11 @@ function attachPaneHandlers(pane, idx) {
     markCurPane();
   }, { passive: false });
 
-  let dragging = false, lx = 0, ly = 0;
   pane.addEventListener("mousedown", (e) => {
     if (S.viewer.mode === "compare") { S.viewer.cur = idx; markCurPane(); }
-    dragging = true; lx = e.clientX; ly = e.clientY;
+    paneDrag = { pane, lx: e.clientX, ly: e.clientY };
     pane.classList.add("grabbing");
   });
-  window.addEventListener("mousemove", (e) => {
-    if (!dragging) return;
-    S.viewer.panx += e.clientX - lx;
-    S.viewer.pany += e.clientY - ly;
-    lx = e.clientX; ly = e.clientY;
-    applyTransform();
-  });
-  window.addEventListener("mouseup", () => { dragging = false; pane.classList.remove("grabbing"); });
   pane.addEventListener("dblclick", () => resetZoom());
 }
 
@@ -768,6 +858,16 @@ function markCurPane() {
   renderViewerMeta();
 }
 
+// warm the browser (and server render) cache for the neighbours of the
+// current loupe image so S/F navigation feels instant
+function preloadNeighbors() {
+  const v = S.viewer;
+  if (!v || v.mode !== "loupe") return;
+  for (const i of [v.cur + 1, v.cur - 1]) {
+    if (v.paths[i]) new Image().src = previewUrl(v.paths[i]);
+  }
+}
+
 function loupeGo(i) {
   const v = S.viewer;
   v.cur = Math.max(0, Math.min(v.paths.length - 1, i));
@@ -775,8 +875,9 @@ function loupeGo(i) {
   v.zoom = 1; v.panx = 0; v.pany = 0;
   const pane = panesEl.children[0];
   const img = pane._img;
+  img.style.filter = ""; img.style.border = "";   // drop any live edit layers
   const url = previewUrl(v.paths[v.cur]);
-  img.onload = () => { computeFit(0, pane, img); applyTransform(); updateHud(); };
+  img.onload = () => { computeFit(0, pane, img); applyTransform(); updateHud(); drawHistogram(); };
   if (img.getAttribute("src") !== url) img.src = url;
   // if it's already cached/complete, onload may not fire — fit now
   if (img.complete && img.naturalWidth) computeFit(0, pane, img);
@@ -787,6 +888,219 @@ function loupeGo(i) {
   if (gi >= 0) setCursor(gi, true);
   if (S.editor) bindEditor(v.paths[v.cur]);   // editor follows the current photo
   renderViewerMeta();
+  if (S.showMeta) renderMeta();
+  preloadNeighbors();
+  drawHistogram();
+}
+
+// ---- EXIF info panel (I), on by default ----
+function toggleMeta() {
+  S.showMeta = !S.showMeta;
+  localStorage.setItem("showMeta", S.showMeta ? "1" : "0");
+  if (S.showMeta) renderMeta();
+  else $("metaPanel").classList.add("hidden");
+}
+
+async function renderMeta() {
+  const p = currentPhoto();
+  if (!p || !S.viewer || S.viewer.mode !== "loupe") return;
+  const el = $("metaPanel");
+  el.classList.remove("hidden");
+  el.innerHTML = `<div class="mrow"><span class="mkey">Loading…</span></div>`;
+  try {
+    const m = await api("/api/meta?path=" + encodeURIComponent(p.path));
+    const cur = currentPhoto();   // user may have navigated meanwhile
+    if (!S.showMeta || !cur || cur.path !== p.path) return;
+    const rows = [
+      ["Camera", m.camera],
+      ["Lens", m.lens],
+      ["Focal", m.focal],
+      ["Shutter", m.shutter],
+      ["Aperture", m.aperture],
+      ["ISO", m.iso && String(m.iso).replace(/^ISO /, "")],
+      ["Size", m.width ? `${m.width} × ${m.height}` : null],
+      ["File", (m.size / 1048576).toFixed(1) + " MB"],
+      ["Taken", p.taken ? new Date(p.taken * 1000).toLocaleString() : null],
+    ].filter(([, v]) => v);
+    el.innerHTML = rows.map(([k, v]) =>
+      `<div class="mrow"><span class="mkey">${k}</span><span>${v}</span></div>`).join("") ||
+      `<div class="mrow"><span class="mkey">No EXIF data</span></div>`;
+  } catch (e) {
+    el.innerHTML = `<div class="mrow"><span class="mkey">No EXIF data</span></div>`;
+  }
+}
+
+// ---- histogram (H): live RGB histogram of the current pane, with a white
+// "before" outline of the unedited original overlaid so any edit's effect —
+// auto-levels included, but this works for all of them — is visible at a
+// glance. Computed client-side from the already-loaded preview image, no
+// extra server work beyond one cached fetch of the original per photo. ----
+function toggleHist() {
+  S.showHist = !S.showHist;
+  localStorage.setItem("showHist", S.showHist ? "1" : "0");
+  $("histBtn").classList.toggle("active", S.showHist);
+  drawHistogram();
+}
+
+// downsize onto a small offscreen canvas before sampling — a histogram is a
+// statistical summary, full preview resolution buys nothing but slower reads
+function sampleImageData(img, maxDim = 160) {
+  const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+  if (!w || !h) return null;
+  const scale = Math.min(1, maxDim / Math.max(w, h));
+  const sw = Math.max(1, Math.round(w * scale)), sh = Math.max(1, Math.round(h * scale));
+  const c = document.createElement("canvas");
+  c.width = sw; c.height = sh;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, sw, sh);
+  try { return ctx.getImageData(0, 0, sw, sh).data; }
+  catch (e) { return null; }
+}
+function channelHist(data) {
+  const r = new Uint32Array(256), g = new Uint32Array(256), b = new Uint32Array(256);
+  for (let i = 0; i < data.length; i += 4) { r[data[i]]++; g[data[i + 1]]++; b[data[i + 2]]++; }
+  return { r, g, b };
+}
+function lumaHist(data) {
+  const l = new Uint32Array(256);
+  for (let i = 0; i < data.length; i += 4) {
+    l[(data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114) | 0]++;
+  }
+  return l;
+}
+function channelMeans(data) {
+  let rs = 0, gs = 0, bs = 0, n = 0;
+  for (let i = 0; i < data.length; i += 4) { rs += data[i]; gs += data[i + 1]; bs += data[i + 2]; n++; }
+  return n ? { r: rs / n, g: gs / n, b: bs / n } : null;
+}
+
+// Rough conversion of a channel-gain shift into Fujifilm's on-camera WB
+// fine-tune units (R/B axes, typically -9..+9). Fuji doesn't publish the
+// exact per-unit gain, so this assumes ~2% channel gain per step — close
+// enough to be a useful starting point, not a calibrated match.
+function fujiWbShift(fromMeans, toMeans) {
+  if (!fromMeans || !toMeans || !fromMeans.r || !fromMeans.b) return null;
+  const toUnits = (pct) => Math.max(-9, Math.min(9, Math.round(pct / 2)));
+  const ru = toUnits((toMeans.r / fromMeans.r - 1) * 100);
+  const bu = toUnits((toMeans.b / fromMeans.b - 1) * 100);
+  if (!ru && !bu) return null;
+  const fmt = (n) => (n > 0 ? `+${n}` : String(n));
+  return `R${fmt(ru)} B${fmt(bu)}`;
+}
+function drawHistCurve(ctx, hist, w, h, color, fill) {
+  const max = Math.max(1, ...hist);   // log scale: one blown-out spike shouldn't flatten the rest
+  ctx.beginPath();
+  for (let i = 0; i < 256; i++) {
+    const x = (i / 255) * w;
+    const y = h - (Math.log1p(hist[i]) / Math.log1p(max)) * h;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  if (fill) {
+    ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
+    ctx.fillStyle = color; ctx.fill();
+  } else {
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+}
+
+// caches of per-photo stats computed from a fetched preview — the file's
+// pixels never change, so these are stable for the whole session; capped so
+// a long shoot doesn't grow them without bound
+const histCache = new Map();     // path -> {luma, means} of the ORIGINAL (edits={})
+const autoCache = new Map();     // path -> means of the AUTO-LEVELS-ONLY render
+function capCache(cache, path, val) {
+  cache.set(path, val);
+  if (cache.size > 50) cache.delete(cache.keys().next().value);
+}
+// fetch `previewUrl(path, edits)`, run `compute` on its sampled pixels, cache by path in `cache`
+function statsFromPreview(cache, path, edits, compute) {
+  if (cache.has(path)) return Promise.resolve(cache.get(path));
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const pixels = sampleImageData(img);
+      const val = pixels ? compute(pixels) : null;
+      capCache(cache, path, val);
+      resolve(val);
+    };
+    img.onerror = () => { capCache(cache, path, null); resolve(null); };
+    img.src = previewUrl(path, edits);
+  });
+}
+const getOrigStats = (path) =>
+  statsFromPreview(histCache, path, {}, (px) => ({ luma: lumaHist(px), means: channelMeans(px) }));
+const getAutoOnlyMeans = (path) =>
+  statsFromPreview(autoCache, path, { auto: true }, channelMeans);
+
+// plain-English diff of the edit stack vs. the untouched original — this is
+// what actually answers "what did auto (or anything else) change", the
+// histogram only shows the tonal shift that results from it
+function describeEdits(edits) {
+  if (!edits) return [];
+  const out = [];
+  if (edits.rot) out.push(`Rotate ${edits.rot}°`);
+  if (edits.fine) out.push(`Straighten ${edits.fine > 0 ? "+" : ""}${edits.fine}°`);
+  if (edits.flipH) out.push("Flip horizontal");
+  if (edits.flipV) out.push("Flip vertical");
+  if (edits.crop) out.push("Cropped");
+  if (edits.auto) out.push("Auto-levels");
+  if (edits.wbR) out.push(`WB Red ${edits.wbR > 0 ? "+" : ""}${edits.wbR.toFixed(2)}`);
+  if (edits.wbB) out.push(`WB Blue ${edits.wbB > 0 ? "+" : ""}${edits.wbB.toFixed(2)}`);
+  if (edits.temp) out.push(`White balance (legacy) ${edits.temp > 0 ? "+" : ""}${edits.temp.toFixed(2)}`);
+  if (edits.bright != null && edits.bright !== 1) out.push(`Brightness ×${edits.bright.toFixed(2)}`);
+  if (edits.contrast != null && edits.contrast !== 1) out.push(`Contrast ×${edits.contrast.toFixed(2)}`);
+  if (edits.saturation != null && edits.saturation !== 1) out.push(`Saturation ×${edits.saturation.toFixed(2)}`);
+  if (edits.sharpness != null && edits.sharpness !== 1) out.push(`Sharpness ×${edits.sharpness.toFixed(2)}`);
+  if (edits.border && edits.border.w) out.push(`Border ${Math.round(edits.border.w * 100)}% ${edits.border.color}`);
+  return out;
+}
+
+async function drawHistogram() {
+  const panel = $("histPanel");
+  if (!S.showHist || !S.editor || !S.viewer || S.viewer.mode !== "loupe") {
+    panel.classList.add("hidden");
+    return;
+  }
+  const pane = panesEl.children[0];
+  if (!pane || !pane._img || !pane._img.naturalWidth) return;
+  panel.classList.remove("hidden");
+  const canvas = $("histCanvas");
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  const data = sampleImageData(pane._img);
+  if (data) {
+    const { r, g, b } = channelHist(data);
+    ctx.globalCompositeOperation = "lighter";
+    drawHistCurve(ctx, r, w, h, "rgba(255,80,80,.55)", true);
+    drawHistCurve(ctx, g, w, h, "rgba(80,255,120,.55)", true);
+    drawHistCurve(ctx, b, w, h, "rgba(90,140,255,.55)", true);
+    ctx.globalCompositeOperation = "source-over";
+  }
+
+  const p = editorPhoto();
+  const list = describeEdits(p ? p.edits : null);
+
+  if (p && p.edits) {   // nothing to compare against when there are no edits
+    const wantAuto = !!p.edits.auto;
+    const [orig, autoMeans] = await Promise.all([
+      getOrigStats(p.path),
+      wantAuto ? getAutoOnlyMeans(p.path) : Promise.resolve(null),
+    ]);
+    if (!S.showHist || editorPhoto() !== p) return;   // stale after the await
+    if (orig) {
+      drawHistCurve(ctx, orig.luma, w, h, "rgba(255,255,255,.85)", false);
+      if (wantAuto && autoMeans) {
+        const wb = fujiWbShift(orig.means, autoMeans);
+        if (wb) list.push(`Fuji WB to match Auto: ${wb} (approx.)`);
+      }
+    }
+  }
+
+  $("histChanges").innerHTML = list.length
+    ? list.map((s) => `<div class="hchg">${s}</div>`).join("")
+    : `<div class="hchg muted">No edits — this is the original</div>`;
 }
 
 function renderViewerMeta() {
@@ -830,80 +1144,156 @@ function closeViewer() {
   const ov = document.getElementById("cropOverlay");
   if (ov) ov.remove();
   $("editBar").classList.add("hidden");
+  $("editBar").classList.remove("collapsed-full");   // sidebar hide is transient, not a saved preference
+  S.sidebarCollapsed = false;
+  $("metaPanel").classList.add("hidden");
+  $("histPanel").classList.add("hidden");
   viewer.classList.add("hidden");
   panesEl.innerHTML = "";
 }
 
-window.addEventListener("resize", () => {
-  if (!S.viewer) return;
-  [...panesEl.children].forEach((pane) => computeFit(+pane.dataset.idx, pane, pane._img));
-  applyTransform();
-});
+window.addEventListener("resize", refitPanes);
 
 // ---------------------------------------------------------------------------
-// Editor (loupe only): non-destructive rotate / flip / crop / tone.
-// Edits live in a history stack (undo/redo) and are persisted per-photo; the
-// originals are never written, so Reset / clearing edits fully reverts.
+// Editor (loupe only): non-destructive rotate / flip / crop / border / tone.
+// Each photo carries its own history stack (p._hist / p._hidx), so undo/redo
+// survive navigating between photos within a session; the current state is
+// persisted per-photo. Originals are never written — Reset fully reverts.
 // ---------------------------------------------------------------------------
 const clone = (o) => JSON.parse(JSON.stringify(o || {}));
 const editorPhoto = () => (S.editor ? S.byPath.get(S.editor.path) : null);
-const curEdits = () => (S.editor ? S.editor.hist[S.editor.idx] : {});
+function curEdits() {
+  const p = editorPhoto();
+  return p && p._hist ? p._hist[p._hidx] : {};
+}
 
 // The editor is ambient in loupe view: the bar is always shown and re-binds to
 // whatever photo is current, so navigating keeps editing the right one.
 function bindEditor(path) {
   const p = S.byPath.get(path);
   if (!p) return;
-  if (S.cropMode) exitCropMode();
-  S.editor = { path, hist: [clone(p.edits)], idx: 0 };
+  if (S.cropMode) exitCropMode(false);   // no re-render — we're rebinding anyway
+  if (!p._hist) { p._hist = [clone(p.edits)]; p._hidx = 0; }
+  S.editor = { path, showOrig: false };
   $("editBar").classList.remove("hidden");
   syncEditControls();
+  $("gridBtn").classList.toggle("active", S.showGrid);
+  syncGridOverlay();
+  $("histBtn").classList.toggle("active", S.showHist);
 }
 
 // push a new state (dropping any redo branch), persist, re-render
 function pushEdit(edits) {
-  const e = S.editor;
-  e.hist = e.hist.slice(0, e.idx + 1);
-  e.hist.push(edits);
-  e.idx = e.hist.length - 1;
+  const p = editorPhoto();
+  if (!p) return;
+  p._hist = p._hist.slice(0, p._hidx + 1);
+  p._hist.push(edits);
+  p._hidx = p._hist.length - 1;
   commitEdit();
 }
-function undoEdit() { const e = S.editor; if (e && e.idx > 0) { e.idx--; commitEdit(true); } }
-function redoEdit() { const e = S.editor; if (e && e.idx < e.hist.length - 1) { e.idx++; commitEdit(true); } }
+function undoEdit() { const p = editorPhoto(); if (p && p._hist && p._hidx > 0) { p._hidx--; commitEdit(true); } }
+function redoEdit() { const p = editorPhoto(); if (p && p._hist && p._hidx < p._hist.length - 1) { p._hidx++; commitEdit(true); } }
 
 async function commitEdit(syncControls) {
   const p = editorPhoto();
   if (!p) return;
+  if (S.cropMode) exitCropMode(false);   // edits changed under the overlay — drop it
+  if (S.editor.showOrig) { S.editor.showOrig = false; $("origBtn").classList.remove("active"); }
   const edits = curEdits();
-  p.edits = (edits && Object.keys(edits).length) ? edits : null;
+  p.edits = (edits && Object.keys(edits).length) ? clone(edits) : null;
   p._ev = (p._ev || 0) + 1;   // bust browser cache for thumb/stored preview
   if (syncControls) syncEditControls();
   renderEditPreview();
   const vi = S.view.indexOf(p);
   if (vi >= 0) refreshCell(vi);
-  try { await post("/api/edit", { path: p.path, edits: p.edits }); }
-  catch (err) { toast("Edit save failed: " + err.message); }
+  try {
+    await post("/api/edit", { path: p.path, edits: p.edits });
+    refreshThumb(p);   // only after the server knows the new edits (avoids a stale fetch)
+  } catch (err) { toast("Edit save failed: " + err.message); }
 }
 
-// live preview in the pane straight from the edits dict (no DB round-trip)
-function renderEditPreview(overrideEdits) {
+// re-fetch a photo's grid thumbnail after its stored edits changed
+function refreshThumb(p) {
+  const vi = S.view.indexOf(p);
+  if (vi < 0) return;
+  const img = grid.querySelector(`.cell[data-i="${vi}"] img`);
+  if (!img) return;
+  if (img.src) img.src = thumbUrl(p.path);
+  else img.dataset.src = thumbUrl(p.path);   // not lazily loaded yet
+}
+
+// server render of the edits dict into the pane. Live CSS layers (filter,
+// border, straighten transform) stay up until the baked image arrives, so
+// there's no flash back to the unedited base.
+function renderEditPreview(overrideEdits, keepLive) {
   const pane = panesEl.children[0];
-  if (!pane) return;
+  if (!pane || !S.editor) return;
   const img = pane._img;
   const edits = overrideEdits !== undefined ? overrideEdits : curEdits();
-  img.onload = () => { computeFit(0, pane, img); applyTransform(); updateHud(); };
-  img.src = previewUrl(S.editor.path, edits);
+  const url = previewUrl(S.editor.path, edits);
+  img.onload = () => {
+    if (!keepLive) {   // keepLive: a drag is in progress, its live layer stays
+      img.style.filter = ""; img.style.border = "";
+      if (S.editor) S.editor.liveFine = 0;
+      drawHistogram();
+    }
+    computeFit(0, pane, img); applyTransform(); updateHud();
+  };
+  if (img.getAttribute("src") === url) {
+    if (img.complete && img.naturalWidth) img.onload();
+  } else {
+    img.src = url;
+  }
+}
+
+// flip the loupe between the untouched original and the edited version
+function toggleOriginal() {
+  const p = editorPhoto();
+  if (!p) return;
+  if (!S.editor.showOrig && !p.edits) { toast("No edits — this is the original"); return; }
+  if (S.cropMode) exitCropMode(false);
+  S.editor.showOrig = !S.editor.showOrig;
+  $("origBtn").classList.toggle("active", S.editor.showOrig);
+  renderEditPreview(S.editor.showOrig ? {} : undefined);
+  toast(S.editor.showOrig ? "Original" : "Edited", 900);
+}
+
+// bake the current edits into a new JPEG next to the original file
+async function saveCopy() {
+  const p = editorPhoto();
+  if (!p) return;
+  if (!p.edits) { toast("No edits to save"); return; }
+  try {
+    const res = await post("/api/save-copy", { path: p.path });
+    const np = res.photo;
+    np.ext = extOf(np.filename);
+    np.edits = null;
+    S.photos.push(np);
+    S.byPath.set(np.path, np);
+    buildGroups();
+    populateTypeFilter();
+    sortPhotos();
+    toast("Saved " + np.filename);
+  } catch (e) { toast("Save copy failed: " + e.message, 4000); }
 }
 
 function syncEditControls() {
   const e = curEdits();
   $("editBar").querySelectorAll("input[data-edit]").forEach((inp) => {
-    const v = e[inp.dataset.edit] != null ? e[inp.dataset.edit] : 1;
+    const v = e[inp.dataset.edit] != null ? e[inp.dataset.edit] : neutralOf(inp.dataset.edit);
     inp.value = v;
-    const out = inp.parentElement.querySelector("output");
-    if (out) out.textContent = (+v).toFixed(2);
+    const num = inp.parentElement.querySelector("input.num");
+    if (num) num.value = (+v).toFixed(2);
   });
+  $("fineR").value = e.fine || 0;
+  $("fineRNum").value = e.fine || 0;
+  $("autoBtn").classList.toggle("active", !!e.auto);
+  const b = e.border || {};
+  $("borderW").value = b.w || 0;
+  $("borderWNum").value = Math.round((b.w || 0) * 1000) / 10;
+  $("borderC").value = b.color || "#ffffff";
   $("cropBtn").classList.toggle("active", !!e.crop || S.cropMode);
+  $("origBtn").classList.toggle("active", !!(S.editor && S.editor.showOrig));
 }
 
 function editAction(act) {
@@ -918,52 +1308,320 @@ function editAction(act) {
     const n = clone(e); n[act] = !n[act]; delete n.crop; pushEdit(n); return;
   }
   if (act === "crop") { S.cropMode ? exitCropMode() : enterCropMode(); return; }
+  if (act === "grid") return toggleGrid();
+  if (act === "hist") return toggleHist();
+  if (act === "auto") {
+    const n = clone(e);
+    if (n.auto) delete n.auto; else n.auto = true;
+    pushEdit(n); return;
+  }
   if (act === "undo") return undoEdit();
   if (act === "redo") return redoEdit();
-  if (act === "reset") { if (S.cropMode) exitCropMode(); pushEdit({}); return; }
+  if (act === "reset") return pushEdit({});   // commitEdit clears crop mode
+  if (act === "orig") return toggleOriginal();
+  if (act === "save") return saveCopy();
+  if (act === "presetApply") return applySelectedPreset();
+  if (act === "presetSave") return saveCurrentAsPreset();
+  if (act === "presetDel") return deleteSelectedPreset();
 }
 
-// ---- tonal sliders: live CSS-filter preview while dragging, bake on release ----
-const TONAL = { bright: "brightness", contrast: "contrast", saturation: "saturate" };
+// ---- copy/paste the whole edit stack between photos (Ctrl+C / Ctrl+V) ----
+// In the loupe editor: copies/applies to the one photo being edited (undoable).
+// In the grid: copies the active cell's edits; paste applies to every photo in
+// the compare selection (Space to multi-select), or the active cell if none.
+let copiedEdits = null;
+function copyEdits() {
+  const e = curEdits();
+  if (!e || !Object.keys(e).length) { toast("No edits to copy"); return; }
+  copiedEdits = clone(e);
+  updatePasteBtn();
+  toast("Edits copied");
+}
+function pasteEdits() {
+  if (!copiedEdits) { toast("No copied edits — Ctrl+C on an edited photo first"); return; }
+  if (JSON.stringify(copiedEdits) === JSON.stringify(curEdits())) { toast("Already applied"); return; }
+  pushEdit(clone(copiedEdits));
+  toast("Edits pasted");
+}
+
+function copyEditsFromGrid() {
+  const p = S.view[activeIndex()];
+  if (!p || !p.edits) { toast("No edits to copy"); return; }
+  copiedEdits = clone(p.edits);
+  updatePasteBtn();
+  toast("Edits copied — select photos (Space) and Ctrl+V, or paste onto one");
+}
+
+// paths to act on for a grid-level apply: the compare selection if any photos
+// are selected, else just the currently active cell
+function targetSelection() {
+  if (S.compare.length) return S.compare.slice();
+  const p = S.view[activeIndex()];
+  return p ? [p.path] : [];
+}
+
+// Write `edits` onto every photo in `targets`, saving each to the server and
+// giving each its own one-step undo history entry (so opening one later and
+// hitting Ctrl+Z reverts just this apply).
+async function applyEditsToSelection(edits, label) {
+  if (!edits) { toast("Nothing to apply"); return; }
+  const targets = targetSelection();
+  if (!targets.length) { toast("No photo selected"); return; }
+  for (const path of targets) {
+    const p = S.byPath.get(path);
+    if (!p) continue;
+    if (!p._hist) { p._hist = [clone(p.edits)]; p._hidx = 0; }
+    p._hist = p._hist.slice(0, p._hidx + 1);
+    p._hist.push(clone(edits));
+    p._hidx = p._hist.length - 1;
+    p.edits = (edits && Object.keys(edits).length) ? clone(edits) : null;
+    p._ev = (p._ev || 0) + 1;
+    const vi = S.view.indexOf(p);
+    if (vi >= 0) refreshCell(vi);
+  }
+  const n = targets.length;
+  try {
+    await Promise.all(targets.map((path) =>
+      post("/api/edit", { path, edits: S.byPath.get(path).edits })));
+    targets.forEach((path) => refreshThumb(S.byPath.get(path)));
+    toast(`Applied ${label} to ${n} photo${n === 1 ? "" : "s"}`);
+  } catch (e) { toast("Save failed: " + e.message); }
+}
+
+function pasteEditsToSelection() {
+  if (!copiedEdits) { toast("No copied edits — Ctrl+C on an edited photo first"); return; }
+  applyEditsToSelection(copiedEdits, "edits");
+}
+
+function updatePasteBtn() {
+  const btn = $("pasteBtn");
+  if (!btn) return;
+  btn.disabled = !copiedEdits;
+  const n = S.compare.length;
+  btn.textContent = n ? `📋 Paste edits (${n})` : "📋 Paste edits";
+  btn.title = copiedEdits
+    ? `Paste copied edits onto ${n ? n + " selected photos" : "the current photo"} (Ctrl+V)`
+    : "Copy edits first: open a photo, Ctrl+C";
+}
+
+// ---- named presets: save the current edit stack, apply it later — either to
+// the photo being edited, or to a whole grid selection. Stored in localStorage
+// since they're just reusable templates, not per-photo state. ----
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function loadPresets() {
+  try { return JSON.parse(localStorage.getItem("editPresets") || "[]"); }
+  catch (e) { return []; }
+}
+function savePresets(list) { localStorage.setItem("editPresets", JSON.stringify(list)); }
+function presetEdits(name) {
+  const found = loadPresets().find((p) => p.name === name);
+  return found ? found.edits : null;
+}
+function populatePresetSelects() {
+  const opts = '<option value="">Preset…</option>' +
+    loadPresets().map((p) => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`).join("");
+  $("presetSel").innerHTML = opts;
+  $("presetGridSel").innerHTML = opts.replace("Preset…", "🎛 Preset…");
+}
+function saveCurrentAsPreset() {
+  if (!S.editor) return;
+  const e = curEdits();
+  if (!e || !Object.keys(e).length) { toast("No edits to save as a preset"); return; }
+  const name = (prompt("Preset name:") || "").trim();
+  if (!name) return;
+  const list = loadPresets().filter((p) => p.name !== name);   // replace same-name
+  list.push({ name, edits: clone(e) });
+  savePresets(list);
+  populatePresetSelects();
+  $("presetSel").value = name;
+  toast(`Preset "${name}" saved`);
+}
+function applySelectedPreset() {
+  const name = $("presetSel").value;
+  if (!name) { toast("Choose a preset first"); return; }
+  const edits = presetEdits(name);
+  if (!edits) return;
+  pushEdit(clone(edits));
+  toast(`Applied "${name}"`);
+}
+function deleteSelectedPreset() {
+  const name = $("presetSel").value;
+  if (!name) { toast("Choose a preset first"); return; }
+  savePresets(loadPresets().filter((p) => p.name !== name));
+  populatePresetSelects();
+  toast(`Preset "${name}" deleted`);
+}
+function applyPresetToSelection() {
+  const name = $("presetGridSel").value;
+  if (!name) { toast("Choose a preset first"); return; }
+  const edits = presetEdits(name);
+  if (!edits) return;
+  applyEditsToSelection(edits, `preset "${name}"`);
+  $("presetGridSel").value = "";
+}
+
+// ---- fine rotation (straighten): live rotate+zoom while dragging, exact
+// server render (auto-cropped to the inscribed rect) on release ----
+let fineDragging = false;
+function fineInput() {
+  $("fineRNum").value = Math.round(parseFloat($("fineR").value) * 10) / 10;
+  if (!S.editor) return;
+  if (!fineDragging) {
+    fineDragging = true;
+    syncGridOverlay();   // force the alignment grid on for this drag
+    // base for the live transform: current edits minus fine/crop/border —
+    // the same frame the server rotates before those steps
+    const base = clone(curEdits());
+    delete base.fine; delete base.crop; delete base.border;
+    renderEditPreview(base, true);
+  }
+  S.editor.liveFine = parseFloat($("fineR").value) || 0;
+  applyTransform();
+}
+function fineCommit() {
+  fineDragging = false;
+  syncGridOverlay();   // drop the forced grid if the toggle is off
+  if (!S.editor) return;
+  const v = Math.round(parseFloat($("fineR").value) * 10) / 10;
+  const cur = curEdits();
+  if (v === (cur.fine || 0)) { renderEditPreview(); return; }   // unchanged — settle back
+  const n = clone(cur);
+  if (v) n.fine = v; else delete n.fine;
+  delete n.crop;   // crop coords are tied to the old geometry — drop them
+  pushEdit(n);
+  $("fineR").blur(); $("fineRNum").blur();
+}
+
+// ---- border: live CSS border while dragging, server-baked on release ----
+let borderDragging = false;
+function borderInput() {
+  $("borderWNum").value = Math.round(parseFloat($("borderW").value) * 1000) / 10;
+  if (!S.editor) return;
+  if (!borderDragging) {
+    borderDragging = true;
+    // drop the baked border so the live CSS border isn't doubled
+    const base = clone(curEdits());
+    delete base.border;
+    renderEditPreview(base, true);
+  }
+  applyLiveBorder();
+}
+function applyLiveBorder() {
+  const pane = panesEl.children[0];
+  const f = S.viewer && S.viewer._fit[0];
+  if (!pane || !f) return;
+  const w = parseFloat($("borderW").value);
+  const px = Math.round(w * Math.min(f.nw, f.nh));
+  pane._img.style.border = px > 0 ? `${px}px solid ${$("borderC").value}` : "";
+}
+function borderCommit() {
+  borderDragging = false;
+  if (!S.editor) return;
+  const w = parseFloat($("borderW").value);
+  const cur = curEdits();
+  const prev = cur.border || {};
+  if (w === (prev.w || 0) && (!w || $("borderC").value === prev.color)) {
+    renderEditPreview();   // unchanged — settle back
+    return;
+  }
+  const n = clone(cur);
+  if (w > 0) n.border = { w, color: $("borderC").value };
+  else delete n.border;
+  pushEdit(n);
+  $("borderW").blur(); $("borderC").blur();
+}
+
+// ---- tonal sliders: live preview while dragging, bake on release ----
+// bright/contrast/saturation map to CSS filters; wbR/wbB are an exact
+// feColorMatrix (same independent R/B gains as the server); sharpness is an
+// feConvolveMatrix built from the same blend PIL uses (identity·v + SMOOTH·(1-v)).
+const LIVE_KEYS = ["bright", "contrast", "saturation", "sharpness", "wbR", "wbB"];
+const neutralOf = (k) => (k === "wbR" || k === "wbB" ? 0 : 1);
 let sliderDragging = false;
 
 function geomEdits() {
   const e = clone(curEdits());
-  delete e.bright; delete e.contrast; delete e.saturation; delete e.sharpness;
+  for (const k of LIVE_KEYS) delete e[k];
   return e;
 }
+function sliderVal(k) {
+  const inp = $("editBar").querySelector(`input[data-edit="${k}"]`);
+  return inp ? parseFloat(inp.value) : neutralOf(k);
+}
 function liveFilter() {
-  return Object.entries(TONAL).map(([k, fn]) => {
-    const inp = $("editBar").querySelector(`input[data-edit="${k}"]`);
-    return `${fn}(${inp ? inp.value : 1})`;
-  }).join(" ");
+  const parts = [];
+  const wr = sliderVal("wbR"), wb = sliderVal("wbB");
+  if (wr || wb) {
+    $("liveWBMat").setAttribute("values",
+      `${1 + 0.3 * wr} 0 0 0 0  0 1 0 0 0  0 0 ${1 + 0.3 * wb} 0 0  0 0 0 1 0`);
+    parts.push("url(#liveWB)");
+  }
+  parts.push(`brightness(${sliderVal("bright")}) contrast(${sliderVal("contrast")}) ` +
+             `saturate(${sliderVal("saturation")})`);
+  const s = sliderVal("sharpness");
+  if (Math.abs(s - 1) > 1e-6) {
+    const e = (1 - s) / 13, c = s + 5 * (1 - s) / 13;
+    $("liveSharpMat").setAttribute("kernelMatrix",
+      `${e} ${e} ${e} ${e} ${c} ${e} ${e} ${e} ${e}`);
+    parts.push("url(#liveSharp)");
+  }
+  return parts.join(" ");
 }
 function sliderInput(inp) {
-  const out = inp.parentElement.querySelector("output");
-  if (out) out.textContent = parseFloat(inp.value).toFixed(2);
+  const num = inp.parentElement.querySelector("input.num");
+  if (num) num.value = parseFloat(inp.value).toFixed(2);
   const pane = panesEl.children[0];
-  if (!pane) return;
+  if (!pane || !S.editor) return;
   // first move: drop the baked-in tonal layer so the live filter isn't doubled
-  if (!sliderDragging) { sliderDragging = true; pane._img.src = previewUrl(S.editor.path, geomEdits()); }
-  pane._img.style.filter = liveFilter();   // sharpness has no CSS equiv — baked on release
+  if (!sliderDragging) { sliderDragging = true; renderEditPreview(geomEdits(), true); }
+  pane._img.style.filter = liveFilter();
 }
 function sliderCommit(inp) {
   sliderDragging = false;
-  const pane = panesEl.children[0];
-  if (pane) pane._img.style.filter = "";
   const n = clone(curEdits());
   const val = parseFloat(inp.value);
-  if (Math.abs(val - 1) < 1e-6) delete n[inp.dataset.edit]; else n[inp.dataset.edit] = val;
-  pushEdit(n);   // server bakes the real result (incl. sharpness)
+  const key = inp.dataset.edit;
+  if (Math.abs(val - neutralOf(key)) < 1e-6) delete n[key]; else n[key] = val;
+  pushEdit(n);   // server bakes the real result; live filter stays until it loads
+  inp.blur();    // release focus so arrow keys go back to navigation
 }
 
-// ---- crop: drag a box on the (un-cropped) rotated frame ----
+// ---- alignment grid: helper lines over the pane for straightening/composition.
+// On by default in edit mode; also force-shown while the straighten slider is
+// being dragged (the actual "easier straightening" use case), even if toggled off.
+function toggleGrid() {
+  S.showGrid = !S.showGrid;
+  localStorage.setItem("showGrid", S.showGrid ? "1" : "0");
+  $("gridBtn").classList.toggle("active", S.showGrid);
+  syncGridOverlay();
+}
+function syncGridOverlay() {
+  const pane = panesEl.children[0];
+  if (!pane || !S.viewer || S.viewer.mode !== "loupe") return;
+  const show = !!S.editor && (S.showGrid || fineDragging);
+  let ov = pane.querySelector(".gridoverlay");
+  if (show && !ov) {
+    ov = document.createElement("div");
+    ov.className = "gridoverlay";
+    pane.appendChild(ov);
+  } else if (!show && ov) {
+    ov.remove();
+  }
+}
+
+// ---- crop: drag a box on the (un-cropped, un-bordered) rotated frame ----
 function enterCropMode() {
   if (!S.editor) return;
+  if (S.editor.showOrig) { S.editor.showOrig = false; $("origBtn").classList.remove("active"); }
   S.cropMode = true;
   $("cropBtn").classList.add("active");
   toast("Drag a box to crop · Esc cancels");
-  const noCrop = clone(curEdits()); delete noCrop.crop;
+  // strip crop AND border: crop coords are normalized against the bare frame,
+  // so the overlay must be drawn on that same frame
+  const noCrop = clone(curEdits()); delete noCrop.crop; delete noCrop.border;
   const pane = panesEl.children[0];
   const img = pane._img;
   const url = previewUrl(S.editor.path, noCrop);
@@ -979,12 +1637,15 @@ function enterCropMode() {
   else img.src = url;
 }
 
-function exitCropMode() {
+function exitCropMode(rerender = true) {
   S.cropMode = false;
   $("cropBtn").classList.remove("active");
   const ov = document.getElementById("cropOverlay");
   if (ov) ov.remove();
-  if (S.editor) renderEditPreview();
+  // rerender=false when the caller is about to render something else anyway
+  // (rebinding to another photo, committing an edit) — re-rendering here would
+  // flash the previous photo's preview into the pane
+  if (rerender && S.editor) renderEditPreview();
 }
 
 function buildCropOverlay(pane) {
@@ -1078,6 +1739,28 @@ document.addEventListener("keydown", (e) => {
     if (kk === "z") { e.preventDefault(); e.shiftKey ? redoEdit() : undoEdit(); return; }
     if (kk === "y") { e.preventDefault(); redoEdit(); return; }
   }
+  // Tab hides/shows the whole edit sidebar (Lightroom's "hide panels" shortcut)
+  // — handled early so it works even with a slider focused, and takes
+  // priority over the browser's default focus-cycling.
+  if (S.viewer && S.viewer.mode === "loupe" && e.key === "Tab" &&
+      !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    toggleSidebar();
+    return;
+  }
+  // copy/paste the edit stack — but not while a text field owns Ctrl+C/V.
+  // In the loupe editor: acts on the one photo being edited. In the grid:
+  // copies the active cell, pastes onto the compare selection (or active cell).
+  if ((e.ctrlKey || e.metaKey) && !inField(e)) {
+    const kk = e.key.toLowerCase();
+    if (S.editor) {
+      if (kk === "c") { e.preventDefault(); copyEdits(); return; }
+      if (kk === "v") { e.preventDefault(); pasteEdits(); return; }
+    } else if (!S.viewer) {
+      if (kk === "c") { e.preventDefault(); copyEditsFromGrid(); return; }
+      if (kk === "v") { e.preventDefault(); pasteEditsToSelection(); return; }
+    }
+  }
   // modals
   if (!$("help").classList.contains("hidden") && e.key === "Escape") { $("help").classList.add("hidden"); return; }
   if (!$("splitModal").classList.contains("hidden")) {
@@ -1104,6 +1787,7 @@ document.addEventListener("keydown", (e) => {
     case "r": markCurrent({ flag: -1 }, true); return;
     case "q": markCurrent({ flag: 0 }, false); return;
     case "`": markCurrent({ rating: 0 }, false); return;
+    case "u": undoMark(); return;
   }
   // Compare best-pick: in compare view with ≤3 images, S/D/F keep that pane,
   // reject the rest, and close. (Overrides compare nav/zoom for those keys.)
@@ -1119,6 +1803,14 @@ document.addEventListener("keydown", (e) => {
       return;
     }
     if (k === "escape") { closeViewer(); return; }
+    // editor shortcuts (loupe only): O original/edited, C crop, I info, G grid, H histogram
+    if (S.viewer.mode === "loupe" && S.editor) {
+      if (k === "o") { toggleOriginal(); return; }
+      if (k === "c") { editAction("crop"); return; }
+      if (k === "i") { toggleMeta(); return; }
+      if (k === "g") { toggleGrid(); return; }
+      if (k === "h") { toggleHist(); return; }
+    }
     if (S.viewer.mode === "tournament") {
       switch (k) {
         case "arrowleft": case "s": tournamentVote("left"); return;
@@ -1380,14 +2072,64 @@ $("exCompress").addEventListener("change", (e) => {
 
 // ---- editor ----
 $("editBar").addEventListener("click", (e) => {
+  const head = e.target.closest(".ed-sec-head");
+  if (head) { toggleSection(head.closest(".ed-section")); return; }
   const b = e.target.closest("button[data-act]");
   if (b) editAction(b.dataset.act);
 });
+$("sidebarToggle").addEventListener("click", toggleSidebar);
 $("editBar").querySelectorAll("input[data-edit]").forEach((inp) => {
   inp.addEventListener("input", () => sliderInput(inp));
   inp.addEventListener("change", () => sliderCommit(inp));
   inp.addEventListener("dblclick", () => { inp.value = 1; sliderCommit(inp); });
 });
+// numeric twin of each tonal slider: type an exact value, Enter/blur commits
+$("editBar").querySelectorAll("input.num[data-num]").forEach((num) => {
+  num.addEventListener("change", () => {
+    const range = $("editBar").querySelector(`input[data-edit="${num.dataset.num}"]`);
+    if (!range || !S.editor) return;
+    let v = parseFloat(num.value);
+    if (isNaN(v)) v = neutralOf(num.dataset.num);
+    v = Math.max(+range.min, Math.min(+range.max, v));
+    num.value = v.toFixed(2);
+    range.value = v;
+    sliderCommit(range);
+    num.blur();
+  });
+});
+// fine rotation: live rotate while dragging, exact render on release
+$("fineR").addEventListener("input", fineInput);
+$("fineR").addEventListener("change", fineCommit);
+$("fineR").addEventListener("dblclick", () => { $("fineR").value = 0; fineCommit(); });
+$("fineRNum").addEventListener("change", () => {
+  let v = parseFloat($("fineRNum").value);
+  if (isNaN(v)) v = 0;
+  v = Math.max(-45, Math.min(45, Math.round(v * 10) / 10));
+  $("fineRNum").value = v;
+  $("fineR").value = v;
+  fineCommit();
+});
+// border: live CSS border while dragging (width or color), baked on release
+$("borderW").addEventListener("input", borderInput);
+$("borderW").addEventListener("change", borderCommit);
+$("borderW").addEventListener("dblclick", () => { $("borderW").value = 0; borderCommit(); });
+$("borderWNum").addEventListener("change", () => {
+  let v = parseFloat($("borderWNum").value);
+  if (isNaN(v)) v = 0;
+  v = Math.max(0, Math.min(15, v));
+  $("borderWNum").value = v;
+  $("borderW").value = v / 100;
+  borderCommit();
+  $("borderWNum").blur();
+});
+$("borderC").addEventListener("input", borderInput);
+$("borderC").addEventListener("change", borderCommit);
+
+// ---- grid-view: paste edits to the compare selection, apply a preset ----
+$("pasteBtn").addEventListener("click", pasteEditsToSelection);
+$("presetGridApply").addEventListener("click", applyPresetToSelection);
+populatePresetSelects();
+updatePasteBtn();
 
 // ---- date split ----
 $("splitBtn").addEventListener("click", openSplit);
@@ -1419,5 +2161,77 @@ function applyGridSize(px) {
   if (saved !== null) S.groupRaw = saved === "1";
   $("groupRaw").checked = S.groupRaw;
 })();
+
+// ---- EXIF panel / alignment grid: on by default, persisted once toggled ----
+(function initTogglePrefs() {
+  const sm = localStorage.getItem("showMeta");
+  if (sm !== null) S.showMeta = sm === "1";
+  const sg = localStorage.getItem("showGrid");
+  if (sg !== null) S.showGrid = sg === "1";
+  const sh = localStorage.getItem("showHist");
+  if (sh !== null) S.showHist = sh === "1";
+})();
+
+// ---- slider tick marks: dense, evenly-spaced stops so dragging reads as a
+// row of small discrete positions rather than a smooth blur. Generated from
+// each slider's own range rather than hand-written, so they can't drift out
+// of sync — the actual step size (drag/arrow-key precision) is unchanged,
+// this only adds visual ticks. Exact values still go through the numeric
+// field next to each slider.
+//
+// Ticks are drawn in CSS (`.ticked`, styles.css) rather than relying on the
+// native <datalist> — Chrome doesn't render tick marks for a range input's
+// linked datalist at all, so that alone would be invisible for most users.
+// The datalist is still populated too, for browsers (Firefox) that do use it
+// for keyboard-snap hinting. ----
+function fillTicks(datalistId, min, max, count) {
+  const dl = document.getElementById(datalistId);
+  if (!dl) return;
+  dl.innerHTML = "";
+  for (let i = 0; i < count; i++) {
+    const v = min + (max - min) * (i / (count - 1));
+    const opt = document.createElement("option");
+    opt.value = String(Math.round(v * 1000) / 1000);
+    dl.appendChild(opt);
+  }
+  document.querySelectorAll(`input[list="${datalistId}"]`).forEach((inp) => {
+    inp.classList.add("ticked");
+    inp.style.setProperty("--ticks", count - 1);
+  });
+}
+(function initTicks() {
+  fillTicks("ticksMid", 0.2, 2, 10);
+  fillTicks("ticksSat", 0, 2, 11);
+  fillTicks("ticksSharp", 0, 3, 13);
+  fillTicks("ticksBorder", 0, 0.15, 16);
+  fillTicks("ticksFine", -45, 45, 19);
+  fillTicks("ticksTemp", -1, 1, 11);
+})();
+
+// ---- collapsible sidebar sections (click a header), persisted per-section ----
+function toggleSection(sec) {
+  if (!sec) return;
+  const collapsed = sec.classList.toggle("collapsed");
+  if (sec.dataset.sec) localStorage.setItem("edsec_" + sec.dataset.sec, collapsed ? "1" : "0");
+}
+(function initSectionCollapse() {
+  document.querySelectorAll("#editBar .ed-section[data-sec]").forEach((sec) => {
+    if (localStorage.getItem("edsec_" + sec.dataset.sec) === "1") sec.classList.add("collapsed");
+  });
+})();
+
+// ---- whole-sidebar collapse (Tab, or the ◂ tab) — Lightroom's "hide panels"
+// shortcut. Transient (not persisted): it's a "let me see the photo" toggle,
+// not a permanent preference, so it always starts expanded on re-entry. ----
+function refitPanes() {
+  if (!S.viewer) return;
+  [...panesEl.children].forEach((pane) => computeFit(+pane.dataset.idx, pane, pane._img));
+  applyTransform();
+}
+function toggleSidebar() {
+  S.sidebarCollapsed = !S.sidebarCollapsed;
+  $("editBar").classList.toggle("collapsed-full", S.sidebarCollapsed);
+  refitPanes();   // sidebar width just changed the pane's space; no image reload triggers this otherwise
+}
 
 restore();

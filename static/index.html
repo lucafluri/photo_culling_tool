@@ -41,6 +41,11 @@
         <input id="gridSize" type="range" min="110" max="440" step="10" value="200" />
       </label>
       <button id="mouseBtn" title="Mouse mode (B) — hotkeys act on hovered photo">🖱 Mouse</button>
+      <select id="presetGridSel" title="Apply a saved preset to the compare selection (Space to multi-select), or the current photo">
+        <option value="">🎛 Preset…</option>
+      </select>
+      <button id="presetGridApply" title="Apply the selected preset">Apply</button>
+      <button id="pasteBtn" title="Copy edits first: open a photo, Ctrl+C" disabled>📋 Paste edits</button>
       <button id="splitBtn" title="Move files into date-named subfolders">📅 Date split…</button>
       <button id="exportBtn">Export…</button>
       <button id="helpBtn" title="Shortcuts (V or ?)">?</button>
@@ -51,28 +56,143 @@
 
   <!-- Loupe / compare overlay -->
   <div id="viewer" class="hidden">
-    <div id="panes"></div>
-    <div id="editBar" class="editbar hidden">
-      <div class="editgroup">
-        <button data-act="rotL" title="Rotate left">⟲</button>
-        <button data-act="rotR" title="Rotate right">⟳</button>
-        <button data-act="flipH" title="Flip horizontal">⇆</button>
-        <button data-act="flipV" title="Flip vertical">⇅</button>
-        <button data-act="crop" id="cropBtn" title="Crop — drag a box on the image">⛶ Crop</button>
-      </div>
-      <label title="Brightness — double-click to reset">☀
-        <input type="range" data-edit="bright" min="0.2" max="2" step="0.02" value="1" /><output>1.00</output></label>
-      <label title="Contrast — double-click to reset">◐
-        <input type="range" data-edit="contrast" min="0.2" max="2" step="0.02" value="1" /><output>1.00</output></label>
-      <label title="Saturation — double-click to reset">🎨
-        <input type="range" data-edit="saturation" min="0" max="2" step="0.02" value="1" /><output>1.00</output></label>
-      <label title="Sharpness — double-click to reset">🔪
-        <input type="range" data-edit="sharpness" min="0" max="3" step="0.05" value="1" /><output>1.00</output></label>
-      <div class="editgroup">
-        <button data-act="undo" title="Undo (Ctrl+Z)">↶</button>
-        <button data-act="redo" title="Redo (Ctrl+Y)">↷</button>
-        <button data-act="reset" title="Revert to original">Reset</button>
-      </div>
+    <div id="viewerMain">
+      <div id="panes"></div>
+      <aside id="editBar" class="editsidebar hidden">
+        <datalist id="ticksMid"></datalist>
+        <datalist id="ticksSat"></datalist>
+        <datalist id="ticksSharp"></datalist>
+        <datalist id="ticksBorder"></datalist>
+        <datalist id="ticksFine"></datalist>
+        <datalist id="ticksTemp"></datalist>
+
+        <section class="ed-section" data-sec="hist">
+          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Histogram</button>
+          <div class="ed-sec-body">
+            <div id="histPanel" class="histpanel hidden">
+              <canvas id="histCanvas" width="256" height="88"></canvas>
+              <div class="histlegend">
+                <span style="color:#ff5050">R</span> <span style="color:#50ff78">G</span>
+                <span style="color:#5a8cff">B</span> <span class="histghost">— before</span>
+              </div>
+              <div id="histChanges" class="histchanges"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="ed-section" data-sec="info">
+          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Info</button>
+          <div class="ed-sec-body">
+            <div id="metaPanel" class="metapanel hidden"></div>
+          </div>
+        </section>
+
+        <section class="ed-section" data-sec="croprotate">
+          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Crop &amp; Rotate</button>
+          <div class="ed-sec-body">
+            <div class="ed-btnrow">
+              <button data-act="rotL" title="Rotate left">⟲</button>
+              <button data-act="rotR" title="Rotate right">⟳</button>
+              <button data-act="flipH" title="Flip horizontal">⇆</button>
+              <button data-act="flipV" title="Flip vertical">⇅</button>
+            </div>
+            <div class="ed-btnrow">
+              <button data-act="crop" id="cropBtn" title="Crop (C) — drag a box on the image">⛶ Crop</button>
+              <button data-act="grid" id="gridBtn" title="Alignment grid (G) — helps straighten and compose">▦ Grid</button>
+            </div>
+            <div class="ed-row">
+              <div class="ed-head"><span class="ed-label">∠ Straighten</span>
+                <input type="number" class="num" id="fineRNum" min="-45" max="45" step="0.1" value="0" /><span class="unit">°</span></div>
+              <input type="range" id="fineR" min="-45" max="45" step="0.1" value="0" list="ticksFine"
+                     title="+ = clockwise, auto-crops the frame — double-click to reset" />
+            </div>
+          </div>
+        </section>
+
+        <section class="ed-section" data-sec="basic">
+          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Basic</button>
+          <div class="ed-sec-body">
+            <div class="ed-btnrow">
+              <button data-act="auto" id="autoBtn" title="Auto levels — histogram stretch, 1% clip">✨ Auto</button>
+              <button data-act="hist" id="histBtn" title="Histogram + change list (H) — original vs. edited">📊 Histogram</button>
+            </div>
+            <div class="ed-row">
+              <div class="ed-head"><span class="ed-label">🔴 WB Red</span>
+                <input type="number" class="num" data-num="wbR" min="-1" max="1" step="0.05" value="0.00" /></div>
+              <input type="range" data-edit="wbR" min="-1" max="1" step="0.02" value="0" list="ticksTemp" title="double-click to reset" />
+            </div>
+            <div class="ed-row">
+              <div class="ed-head"><span class="ed-label">🔵 WB Blue</span>
+                <input type="number" class="num" data-num="wbB" min="-1" max="1" step="0.05" value="0.00" /></div>
+              <input type="range" data-edit="wbB" min="-1" max="1" step="0.02" value="0" list="ticksTemp" title="double-click to reset" />
+            </div>
+            <div class="ed-row">
+              <div class="ed-head"><span class="ed-label">☀ Brightness</span>
+                <input type="number" class="num" data-num="bright" min="0.2" max="2" step="0.05" value="1.00" /></div>
+              <input type="range" data-edit="bright" min="0.2" max="2" step="0.02" value="1" list="ticksMid" title="double-click to reset" />
+            </div>
+            <div class="ed-row">
+              <div class="ed-head"><span class="ed-label">◐ Contrast</span>
+                <input type="number" class="num" data-num="contrast" min="0.2" max="2" step="0.05" value="1.00" /></div>
+              <input type="range" data-edit="contrast" min="0.2" max="2" step="0.02" value="1" list="ticksMid" title="double-click to reset" />
+            </div>
+            <div class="ed-row">
+              <div class="ed-head"><span class="ed-label">🎨 Saturation</span>
+                <input type="number" class="num" data-num="saturation" min="0" max="2" step="0.05" value="1.00" /></div>
+              <input type="range" data-edit="saturation" min="0" max="2" step="0.02" value="1" list="ticksSat" title="double-click to reset" />
+            </div>
+            <div class="ed-row">
+              <div class="ed-head"><span class="ed-label">🔪 Sharpness</span>
+                <input type="number" class="num" data-num="sharpness" min="0" max="3" step="0.05" value="1.00" /></div>
+              <input type="range" data-edit="sharpness" min="0" max="3" step="0.05" value="1" list="ticksSharp" title="double-click to reset" />
+            </div>
+          </div>
+        </section>
+
+        <section class="ed-section" data-sec="effects">
+          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Effects</button>
+          <div class="ed-sec-body">
+            <div class="ed-row">
+              <div class="ed-head"><span class="ed-label">▢ Border</span>
+                <input type="number" class="num" id="borderWNum" min="0" max="15" step="0.5" value="0" /><span class="unit">%</span>
+                <input type="color" id="borderC" value="#ffffff" title="Border color" /></div>
+              <input type="range" id="borderW" min="0" max="0.15" step="0.005" value="0" list="ticksBorder" title="double-click to remove" />
+            </div>
+          </div>
+        </section>
+
+        <section class="ed-section" data-sec="presets">
+          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Presets</button>
+          <div class="ed-sec-body">
+            <div class="ed-btnrow">
+              <select id="presetSel" title="Saved presets"><option value="">Preset…</option></select>
+            </div>
+            <div class="ed-btnrow">
+              <button data-act="presetApply" title="Load the selected preset onto this photo">Load</button>
+              <button data-act="presetSave" title="Save the current edits as a new preset">＋ Save</button>
+              <button data-act="presetDel" title="Delete the selected preset">🗑</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="ed-section" data-sec="history">
+          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> History</button>
+          <div class="ed-sec-body">
+            <div class="ed-btnrow">
+              <button data-act="undo" title="Undo (Ctrl+Z)">↶ Undo</button>
+              <button data-act="redo" title="Redo (Ctrl+Y)">↷ Redo</button>
+              <button data-act="reset" title="Revert to original">Reset</button>
+            </div>
+            <div class="ed-btnrow">
+              <button data-act="orig" id="origBtn" title="Toggle original / edited (O)">👁 Original</button>
+              <button data-act="save" title="Save edited copy as a new JPEG next to the original">💾 Save copy</button>
+            </div>
+          </div>
+        </section>
+
+        <div class="ed-hint">Tab hides this panel</div>
+      </aside>
+      <button id="sidebarToggle" class="sidebar-toggle-tab" title="Toggle edit panel (Tab)">◂</button>
     </div>
     <div id="viewerHud" class="hud"></div>
   </div>
@@ -98,6 +218,7 @@
           <ul>
             <li><kbd>W</kbd> keep&nbsp;&nbsp;<kbd>R</kbd> reject&nbsp;&nbsp;<kbd>Q</kbd> clear flag</li>
             <li><kbd>1</kbd>–<kbd>5</kbd> stars&nbsp;&nbsp;<kbd>`</kbd> 0 stars</li>
+            <li><kbd>U</kbd> undo last mark</li>
             <li>flags auto-advance to next</li>
           </ul>
           <h3>Compare</h3>
@@ -107,6 +228,13 @@
             <li><kbd>X</kbd> clear compare set</li>
             <li><kbd>S</kbd><kbd>D</kbd><kbd>F</kbd> (≤3 in compare) keep that one, reject rest, close</li>
             <li>&gt;3 selected → vote <kbd>←</kbd>/<kbd>S</kbd> vs <kbd>→</kbd>/<kbd>F</kbd> to find the best</li>
+          </ul>
+          <h3>Edit multiple (grid)</h3>
+          <ul>
+            <li><kbd>Space</kbd>-select several, <kbd>Ctrl</kbd>+<kbd>V</kbd> or 📋 Paste
+              edits applies the last-copied edits to all of them</li>
+            <li>🎛 Preset dropdown + Apply does the same with a saved preset</li>
+            <li>no selection → applies to the highlighted photo</li>
           </ul>
         </div>
         <div>
@@ -118,12 +246,26 @@
             <li><kbd>Z</kbd> / dblclick reset zoom</li>
             <li>marking works here too</li>
           </ul>
-          <h3>Edit (loupe)</h3>
+          <h3>Edit (loupe sidebar)</h3>
           <ul>
-            <li>edit bar: rotate, flip, crop, tone</li>
+            <li>sections: Histogram, Info, Crop &amp; Rotate, Basic, Effects,
+              Presets, History — click a header to collapse it</li>
+            <li><kbd>Tab</kbd> hides/shows the whole sidebar (or click the ◂ tab)</li>
+            <li><kbd>C</kbd> crop · <kbd>O</kbd> original ⇄ edited · <kbd>I</kbd> EXIF · <kbd>G</kbd> grid · <kbd>H</kbd> histogram</li>
+            <li>alignment grid shows by default, forces on while straightening</li>
+            <li>histogram overlays the original's tone curve in white and lists
+              every active edit — how auto-levels (or anything else) actually
+              changed the photo</li>
+            <li>white balance: independent Red/Blue channel sliders — with
+              Auto on, the histogram also estimates the Fuji WB shift (R/B)
+              needed to match what Auto proposed</li>
+            <li>every slider has tick marks and a type-in numeric field</li>
             <li>double-click a slider to reset it</li>
-            <li><kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd> undo / redo</li>
-            <li>non-destructive — Reset reverts</li>
+            <li><kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd> undo / redo (per photo)</li>
+            <li><kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>Ctrl</kbd>+<kbd>V</kbd> copy / paste this photo's edits</li>
+            <li>Preset: Save names the current edits, Load applies one</li>
+            <li>💾 saves an edited copy next to the original</li>
+            <li>non-destructive — Reset reverts, export bakes</li>
           </ul>
           <h3>Mouse mode</h3>
           <ul>
@@ -242,6 +384,19 @@
   </div>
 
   <div id="toast" class="toast hidden"></div>
+
+  <!-- live-edit filters: exact white-balance matrix and PIL-equivalent sharpen
+       kernel, updated from the sliders while dragging -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <filter id="liveWB" color-interpolation-filters="sRGB">
+      <feColorMatrix id="liveWBMat" type="matrix"
+        values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0" />
+    </filter>
+    <filter id="liveSharp" color-interpolation-filters="sRGB">
+      <feConvolveMatrix id="liveSharpMat" order="3" divisor="1"
+        preserveAlpha="true" kernelMatrix="0 0 0 0 1 0 0 0 0" />
+    </filter>
+  </svg>
 
   <script src="/static/app.js"></script>
 </body>
