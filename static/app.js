@@ -16,7 +16,7 @@ const S = {
   viewer: null,        // null | {mode:'loupe'|'compare', paths:[], cur:int, zoom, panx, pany}
   folder: null,        // currently open folder
   haveTrash: false,    // server can send to recycle bin
-  mouseMode: false,    // hotkeys act on the hovered photo
+  mouseMode: true,     // hotkeys act on the hovered photo
   hover: null,         // hovered grid index (mouse mode)
   groupRaw: true,      // combine same-named RAW + JPEG into one item
   editor: null,        // null | {path, showOrig} — active loupe editor
@@ -1884,26 +1884,78 @@ function cycleFilter() {
 async function runExport() {
   const dest = $("exDest").value.trim();
   if (!dest) { $("exStatus").textContent = "Enter a destination folder."; return; }
+
   $("exStatus").textContent = "Exporting…";
   $("exFiles").classList.add("hidden");
+  $("exRun").disabled = true;
+
+  const prog = $("exProgress");
+  const bar  = $("exProgressBar");
+  const lbl  = $("exProgressLabel");
+  prog.classList.remove("hidden");
+  bar.style.width = "0%";
+  lbl.textContent = "";
+
   try {
-    const res = await post("/api/export", {
-      dest,
-      action: $("exAction").value,
-      selection: $("exSel").value,
-      min_rating: parseInt($("exMin").value, 10),
-      keep_structure: $("exStruct").checked,
-      compress: $("exCompress").checked,
-      quality: parseInt($("exQuality").value, 10),
+    const resp = await fetch("/api/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        dest,
+        action: $("exAction").value,
+        selection: $("exSel").value,
+        min_rating: parseInt($("exMin").value, 10),
+        keep_structure: $("exStruct").checked,
+        compress: $("exCompress").checked,
+        quality: parseInt($("exQuality").value, 10),
+      }),
     });
-    const verb = res.action === "move" ? "Moved" : "Copied";
-    let msg = `${verb} ${res.exported} files to ${res.dest}`;
-    if (res.errors.length) msg += ` · ${res.errors.length} errors`;
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+      throw new Error(err.detail || resp.statusText);
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let finalResult = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n\n");
+      buf = lines.pop();   // keep incomplete tail
+      for (const chunk of lines) {
+        const line = chunk.trim();
+        if (!line.startsWith("data:")) continue;
+        const evt = JSON.parse(line.slice(5).trim());
+        if (evt.type === "progress") {
+          const pct = evt.total > 0 ? Math.round((evt.done / evt.total) * 100) : 0;
+          bar.style.width = pct + "%";
+          lbl.textContent = `${evt.done} / ${evt.total} — ${evt.name}`;
+        } else if (evt.type === "done") {
+          finalResult = evt;
+          bar.style.width = "100%";
+        }
+      }
+    }
+
+    if (!finalResult) throw new Error("No response from server");
+    const verb = finalResult.action === "move" ? "Moved" : "Copied";
+    let msg = `${verb} ${finalResult.exported} files to ${finalResult.dest}`;
+    if (finalResult.errors.length) msg += ` · ${finalResult.errors.length} errors`;
     $("exStatus").textContent = msg;
-    renderExFiles(verb, res.files, res.errors);
-    toast(`${verb} ${res.exported} files`);
-    reloadFolder();  // rescan disk: reflects moved-out files and any copies in-tree
-  } catch (e) { $("exStatus").textContent = "Error: " + e.message; }
+    lbl.textContent = "";
+    renderExFiles(verb, finalResult.files, finalResult.errors);
+    toast(`${verb} ${finalResult.exported} files`);
+    reloadFolder();
+  } catch (e) {
+    $("exStatus").textContent = "Error: " + e.message;
+    prog.classList.add("hidden");
+  } finally {
+    $("exRun").disabled = false;
+  }
 }
 
 // list exactly which files landed (and any per-file errors)
@@ -1941,6 +1993,9 @@ function openExport() {
   $("exStatus").textContent = "";
   $("exFiles").classList.add("hidden");
   $("exFiles").innerHTML = "";
+  $("exProgress").classList.add("hidden");
+  $("exProgressBar").style.width = "0%";
+  $("exProgressLabel").textContent = "";
   $("exportModal").classList.remove("hidden");
 }
 
@@ -2033,8 +2088,181 @@ async function confirmDelete() {
 }
 
 // ---------------------------------------------------------------------------
+// Folder tree panel
+// ---------------------------------------------------------------------------
+const treeState = {
+  selected: null,   // currently selected folder path
+  current: null,    // path whose children are listed (null = roots)
+};
+
+function treeOpen() {
+  $("treePanel").classList.remove("hidden");
+  $("treeBtn").classList.add("active");
+  // Start at current open folder's parent, or roots
+  const start = S.folder ? getParentPath(S.folder) : null;
+  treeNavigate(start, S.folder);
+}
+
+function treeClose() {
+  $("treePanel").classList.add("hidden");
+  $("treeBtn").classList.remove("active");
+}
+
+function getParentPath(p) {
+  // Returns parent directory, or null if already a root
+  const sep = p.includes("/") ? "/" : "\\";
+  const parts = p.replace(/[/\\]+$/, "").split(/[/\\]/);
+  if (parts.length <= 1) return null;
+  // Windows drive root: "C:" → null
+  if (/^[A-Za-z]:$/.test(parts[0]) && parts.length === 2) return null;
+  parts.pop();
+  const parent = parts.join(sep);
+  // Handle Windows drive root like "C:"
+  return parent || null;
+}
+
+function buildCrumb(path) {
+  const crumb = $("treeCrumb");
+  if (!path) { crumb.textContent = ""; return; }
+
+  // Split into segments
+  const norm = path.replace(/\\/g, "/");
+  const parts = norm.replace(/\/$/, "").split("/").filter(Boolean);
+
+  crumb.innerHTML = "";
+  // Build cumulative paths
+  let cumulative = [];
+  // Windows: first part may be "C:" — restore backslash
+  parts.forEach((seg, i) => {
+    const isWinDrive = /^[A-Za-z]:$/.test(seg);
+    if (i === 0 && isWinDrive) {
+      cumulative.push(seg + "\\");
+    } else {
+      const prev = cumulative[i - 1] || "";
+      const sep = prev.endsWith("\\") ? "" : "\\";
+      cumulative.push(prev + sep + seg);
+    }
+    if (i > 0) {
+      const s = document.createElement("span");
+      s.className = "crumb-sep"; s.textContent = " › ";
+      crumb.appendChild(s);
+    }
+    const a = document.createElement("span");
+    a.className = "crumb-seg";
+    a.textContent = isWinDrive ? seg + "\\" : seg;
+    const target = cumulative[i];
+    a.addEventListener("click", () => treeNavigate(getParentPath(target), target));
+    crumb.appendChild(a);
+  });
+}
+
+async function treeNavigate(parentPath, preselect) {
+  treeState.current = parentPath || null;
+  treeState.selected = preselect || null;
+  buildCrumb(parentPath);
+  updateTreeOpenBtn();
+
+  const list = $("treeList");
+  list.innerHTML = '<div class="tree-loading">Loading…</div>';
+
+  const url = parentPath
+    ? "/api/folder-tree?path=" + encodeURIComponent(parentPath)
+    : "/api/folder-tree";
+  try {
+    const data = await api(url);
+    renderTreeEntries(data.entries, preselect);
+  } catch (e) {
+    list.innerHTML = '<div class="tree-loading">Error loading folders</div>';
+  }
+}
+
+function renderTreeEntries(entries, preselect) {
+  const list = $("treeList");
+  list.innerHTML = "";
+
+  if (!treeState.current) {
+    // At root level — no "go up" needed
+  } else {
+    // "Go up" row
+    const up = document.createElement("div");
+    up.className = "tree-item";
+    up.innerHTML = '<span class="tree-icon">⬆</span><span class="tree-name" style="color:var(--muted)">.. (up)</span>';
+    up.addEventListener("click", () => {
+      const grandparent = getParentPath(treeState.current);
+      treeNavigate(grandparent, treeState.current);
+    });
+    list.appendChild(up);
+  }
+
+  if (!entries.length) {
+    const empty = document.createElement("div");
+    empty.className = "tree-loading";
+    empty.textContent = "No subfolders";
+    list.appendChild(empty);
+    return;
+  }
+
+  for (const entry of entries) {
+    const row = document.createElement("div");
+    row.className = "tree-item" + (entry.path === preselect ? " selected" : "");
+    row.dataset.path = entry.path;
+
+    const icon = document.createElement("span");
+    icon.className = "tree-icon";
+    icon.textContent = "📁";
+
+    const name = document.createElement("span");
+    name.className = "tree-name";
+    name.textContent = entry.name;
+    name.title = entry.path;
+
+    row.appendChild(icon);
+    row.appendChild(name);
+
+    if (entry.has_children) {
+      const arrow = document.createElement("span");
+      arrow.className = "tree-arrow";
+      arrow.textContent = "▶";
+      arrow.title = "Browse into";
+      arrow.addEventListener("click", (e) => {
+        e.stopPropagation();
+        treeNavigate(entry.path, entry.path);
+      });
+      row.appendChild(arrow);
+    }
+
+    row.addEventListener("click", () => treeSelectItem(entry.path, row));
+    list.appendChild(row);
+  }
+
+  // Scroll selected item into view
+  const sel = list.querySelector(".selected");
+  if (sel) sel.scrollIntoView({ block: "nearest" });
+}
+
+function treeSelectItem(path, rowEl) {
+  // Deselect previous
+  $("treeList").querySelectorAll(".tree-item.selected").forEach(el => el.classList.remove("selected"));
+  rowEl.classList.add("selected");
+  treeState.selected = path;
+  buildCrumb(path);
+  updateTreeOpenBtn();
+}
+
+function updateTreeOpenBtn() {
+  $("treeOpenBtn").disabled = !treeState.selected;
+}
+
+// ---------------------------------------------------------------------------
 // Wire up
 // ---------------------------------------------------------------------------
+$("treeBtn").addEventListener("click", () => {
+  if ($("treePanel").classList.contains("hidden")) treeOpen(); else treeClose();
+});
+$("treePanelClose").addEventListener("click", treeClose);
+$("treeOpenBtn").addEventListener("click", () => {
+  if (treeState.selected) { scanFolder(treeState.selected); treeClose(); }
+});
 $("browseBtn").addEventListener("click", browseFolder);
 $("reloadBtn").addEventListener("click", reloadFolder);
 $("delRejected").addEventListener("click", openDeleteModal);
@@ -2235,3 +2463,4 @@ function toggleSidebar() {
 }
 
 restore();
+toggleMouseMode(true);

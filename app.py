@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -613,6 +613,58 @@ def api_pick_folder():
     return result
 
 
+@app.get("/api/folder-tree")
+def api_folder_tree(path: str = Query(None)):
+    """Return immediate subdirectories of `path` (or drive/home roots if omitted).
+
+    Each entry: {name, path, has_children}.
+    """
+    if not path:
+        # Return filesystem roots: on Windows all lettered drives, on Unix just /
+        if sys.platform == "win32":
+            import string
+            roots = []
+            for letter in string.ascii_uppercase:
+                p = letter + ":\\"
+                if os.path.isdir(p):
+                    roots.append({
+                        "name": p,
+                        "path": p,
+                        "has_children": True,
+                    })
+            return {"entries": roots}
+        else:
+            return {"entries": [{"name": "/", "path": "/", "has_children": True}]}
+
+    path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        raise HTTPException(status_code=400, detail="not a directory")
+
+    entries = []
+    try:
+        names = sorted(os.listdir(path), key=lambda n: n.lower())
+    except PermissionError:
+        return {"entries": []}
+
+    for name in names:
+        if name.startswith("."):
+            continue
+        full = os.path.join(path, name)
+        if not os.path.isdir(full):
+            continue
+        try:
+            has_children = any(
+                os.path.isdir(os.path.join(full, c))
+                for c in os.listdir(full)
+                if not c.startswith(".")
+            )
+        except PermissionError:
+            has_children = False
+        entries.append({"name": name, "path": full, "has_children": has_children})
+
+    return {"entries": entries}
+
+
 @app.post("/api/open")
 def api_open(req: OpenReq):
     photos = scan_folder(req.folder, req.recursive)
@@ -845,11 +897,16 @@ def api_mark(req: MarkReq):
 
 @app.post("/api/export")
 def api_export(req: ExportReq):
+    """Stream export progress as Server-Sent Events.
+
+    Each SSE event is JSON on a single `data:` line.
+    - progress events: {type:"progress", done:int, total:int, name:str}
+    - done event:      {type:"done", exported:int, dest:str, action:str,
+                        files:[...], errors:[...]}
+    """
     dest = os.path.abspath(req.dest)
     os.makedirs(dest, exist_ok=True)
 
-    # only ever act on the currently-open folder, never photos left in the DB
-    # from previously-scanned folders
     folder = get_setting("last_folder")
     folder = os.path.abspath(folder) if folder else None
     with db() as conn:
@@ -866,85 +923,106 @@ def api_export(req: ExportReq):
         else:
             raise HTTPException(status_code=400, detail="bad selection")
 
+    rows = list(rows)
+    total = len(rows)
     quality = max(1, min(100, int(req.quality)))
-    done = 0
-    errors = []
-    files = []   # what actually landed, for the UI to show
-    moved = []   # (old_path, new_path) for DB path fixups after a move
-    baked = set()  # new paths whose edits are now baked in (clear edits on fixup)
-    for r in rows:
-        src = r["path"]
-        if not os.path.isfile(src):
-            errors.append("missing: " + src)
-            continue
-        try:
-            edits = json.loads(r["edits"]) if r["edits"] else None
-        except (TypeError, ValueError):
-            edits = None
-        src_ext = os.path.splitext(src)[1].lower()
-        is_jpeg = src_ext in {".jpg", ".jpeg"}
-        do_compress = req.compress and is_jpeg
-        bake = bool(edits)                  # render the edits into the exported file
-        # Guard: a baked move of a RAW would delete the irreplaceable original and
-        # leave only a JPEG. Keep the RAW (export the baked JPEG as a copy) and warn.
-        keep_raw = bake and req.action == "move" and src_ext in RAW_EXTS
-        # a baked file is always a JPEG, so a non-JPEG source changes extension
-        name = os.path.basename(src)
-        if bake and not is_jpeg:
-            name = os.path.splitext(name)[0] + ".jpg"
-        if req.keep_structure:
-            rel = os.path.join(os.path.dirname(os.path.relpath(src, r["folder"])), name)
-            target = os.path.join(dest, rel)
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-        else:
-            target = os.path.join(dest, name)
-            # avoid clobbering same-named files
-            base, ext = os.path.splitext(target)
-            n = 1
-            while os.path.exists(target):
-                target = "{}_{}{}".format(base, n, ext)
-                n += 1
-        try:
-            if bake:
-                _bake_to_jpeg(src, target, edits, quality if do_compress else 92)
-                if keep_raw:
-                    errors.append("kept RAW (a move would destroy it): " + src)
-                elif req.action == "move":
-                    os.remove(src)
-                    moved.append((src, os.path.abspath(target)))
-                    baked.add(os.path.abspath(target))
-            elif do_compress:
-                _compress_jpeg(src, target, quality)
-                if req.action == "move":
-                    os.remove(src)
-                    moved.append((src, os.path.abspath(target)))
-            elif req.action == "move":
-                shutil.move(src, target)
-                moved.append((src, os.path.abspath(target)))
+
+    def generate():
+        done = 0
+        errors = []
+        files = []
+        moved = []
+        baked = set()
+
+        for r in rows:
+            src = r["path"]
+            name_display = os.path.basename(src)
+
+            if not os.path.isfile(src):
+                errors.append("missing: " + src)
+                yield "data: " + json.dumps({
+                    "type": "progress", "done": done, "total": total,
+                    "name": name_display, "error": True
+                }) + "\n\n"
+                continue
+
+            try:
+                edits = json.loads(r["edits"]) if r["edits"] else None
+            except (TypeError, ValueError):
+                edits = None
+
+            src_ext = os.path.splitext(src)[1].lower()
+            is_jpeg = src_ext in {".jpg", ".jpeg"}
+            do_compress = req.compress and is_jpeg
+            bake = bool(edits)
+            keep_raw = bake and req.action == "move" and src_ext in RAW_EXTS
+            name = os.path.basename(src)
+            if bake and not is_jpeg:
+                name = os.path.splitext(name)[0] + ".jpg"
+
+            if req.keep_structure:
+                rel = os.path.join(
+                    os.path.dirname(os.path.relpath(src, r["folder"])), name)
+                target = os.path.join(dest, rel)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
             else:
-                shutil.copy2(src, target)
-            files.append({"name": os.path.basename(target),
-                          "dest": os.path.abspath(target),
-                          "compressed": do_compress or bake})
-            done += 1
-        except Exception as e:  # noqa
-            errors.append("{}: {}".format(src, e))
+                target = os.path.join(dest, name)
+                base_t, ext_t = os.path.splitext(target)
+                n = 1
+                while os.path.exists(target):
+                    target = "{}_{}{}".format(base_t, n, ext_t)
+                    n += 1
 
-    # A move leaves the source path dangling — repoint each moved file's DB
-    # record to its new location so marks survive and it isn't reported missing.
-    if moved:
-        with _db_lock, db() as conn:
-            for old, new in moved:
-                conn.execute("DELETE FROM photos WHERE path=?", (new,))
-                conn.execute(
-                    "UPDATE photos SET path=?, folder=?, filename=? WHERE path=?",
-                    (new, os.path.dirname(new), os.path.basename(new), old),
-                )
-                if new in baked:   # edits are baked into the moved file now
-                    conn.execute("UPDATE photos SET edits=NULL WHERE path=?", (new,))
+            try:
+                if bake:
+                    _bake_to_jpeg(src, target, edits, quality if do_compress else 92)
+                    if keep_raw:
+                        errors.append("kept RAW (a move would destroy it): " + src)
+                    elif req.action == "move":
+                        os.remove(src)
+                        moved.append((src, os.path.abspath(target)))
+                        baked.add(os.path.abspath(target))
+                elif do_compress:
+                    _compress_jpeg(src, target, quality)
+                    if req.action == "move":
+                        os.remove(src)
+                        moved.append((src, os.path.abspath(target)))
+                elif req.action == "move":
+                    shutil.move(src, target)
+                    moved.append((src, os.path.abspath(target)))
+                else:
+                    shutil.copy2(src, target)
 
-    return {"exported": done, "dest": dest, "action": req.action,
-            "files": files, "errors": errors}
+                files.append({"name": os.path.basename(target),
+                               "dest": os.path.abspath(target),
+                               "compressed": do_compress or bake})
+                done += 1
+            except Exception as e:  # noqa
+                errors.append("{}: {}".format(src, e))
+
+            yield "data: " + json.dumps({
+                "type": "progress", "done": done, "total": total,
+                "name": name_display, "error": False
+            }) + "\n\n"
+
+        # DB fixups for moved files
+        if moved:
+            with _db_lock, db() as conn:
+                for old, new in moved:
+                    conn.execute("DELETE FROM photos WHERE path=?", (new,))
+                    conn.execute(
+                        "UPDATE photos SET path=?, folder=?, filename=? WHERE path=?",
+                        (new, os.path.dirname(new), os.path.basename(new), old),
+                    )
+                    if new in baked:
+                        conn.execute("UPDATE photos SET edits=NULL WHERE path=?", (new,))
+
+        yield "data: " + json.dumps({
+            "type": "done", "exported": done, "dest": dest,
+            "action": req.action, "files": files, "errors": errors
+        }) + "\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 
 @app.post("/api/delete-rejected")

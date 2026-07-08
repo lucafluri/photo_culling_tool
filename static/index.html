@@ -10,6 +10,7 @@
   <header id="topbar">
     <div class="left">
       <strong>Photo Culler</strong>
+      <button id="treeBtn" title="Browse folder tree">📂</button>
       <button id="browseBtn">📁 Choose folder…</button>
       <span id="folderPath" class="folderpath" title="">No folder open</span>
       <label class="chk"><input id="recursive" type="checkbox" checked /> subfolders</label>
@@ -51,6 +52,21 @@
       <button id="helpBtn" title="Shortcuts (V or ?)">?</button>
     </div>
   </header>
+
+  <!-- Folder tree panel -->
+  <div id="treePanel" class="tree-panel hidden">
+    <div class="tree-header">
+      <span class="tree-title">📂 Folders</span>
+      <button id="treePanelClose" class="tree-close" title="Close">✕</button>
+    </div>
+    <div class="tree-pathbar">
+      <span id="treeCrumb" class="tree-crumb"></span>
+    </div>
+    <div id="treeList" class="tree-list"></div>
+    <div class="tree-footer">
+      <button id="treeOpenBtn" class="primary" disabled>Open this folder</button>
+    </div>
+  </div>
 
   <main id="grid" tabindex="0"></main>
 
@@ -312,6 +328,12 @@
           </select></label>
       </div>
       <div id="exStatus" class="status"></div>
+      <div id="exProgress" class="ex-progress hidden">
+        <div class="ex-progress-bar-wrap">
+          <div id="exProgressBar" class="ex-progress-bar"></div>
+        </div>
+        <div id="exProgressLabel" class="ex-progress-label"></div>
+      </div>
       <div id="exFiles" class="exfiles hidden"></div>
       <div class="modal-actions">
         <button id="exCancel">Cancel</button>
