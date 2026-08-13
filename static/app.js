@@ -70,6 +70,14 @@ function previewUrl(p, editsObj) {
 }
 
 // ---------------------------------------------------------------------------
+// Modals — only one is ever open, and whichever it is owns the keyboard.
+// ---------------------------------------------------------------------------
+const MODALS = ["help", "exportModal", "deleteModal", "splitModal"];
+const showModal = (id) => $(id).classList.remove("hidden");
+const hideModal = (id) => $(id).classList.add("hidden");
+const openModal = () => MODALS.find((id) => !$(id).classList.contains("hidden"));
+
+// ---------------------------------------------------------------------------
 // Toast
 // ---------------------------------------------------------------------------
 let toastT = null;
@@ -1719,7 +1727,7 @@ function buildCropOverlay(pane) {
 function openSplit() {
   if (!S.folder) { toast("Open a folder first"); return; }
   $("spStatus").textContent = "";
-  $("splitModal").classList.remove("hidden");
+  showModal("splitModal");
 }
 async function runSplit() {
   $("spStatus").textContent = "Working…";
@@ -1734,7 +1742,7 @@ async function runSplit() {
     $("spStatus").textContent = msg;
     toast(`${verb} ${res.moved} files`);
     $("recursive").checked = true;   // sorted files now live in subfolders
-    $("splitModal").classList.add("hidden");
+    hideModal("splitModal");
     reloadFolder();
   } catch (e) { $("spStatus").textContent = "Error: " + e.message; }
 }
@@ -1776,18 +1784,11 @@ document.addEventListener("keydown", (e) => {
       if (kk === "v") { e.preventDefault(); pasteEditsToSelection(); return; }
     }
   }
-  // modals
-  if (!$("help").classList.contains("hidden") && e.key === "Escape") { $("help").classList.add("hidden"); return; }
-  if (!$("splitModal").classList.contains("hidden")) {
-    if (e.key === "Escape") $("splitModal").classList.add("hidden");
-    return;
-  }
-  if (!$("deleteModal").classList.contains("hidden")) {
-    if (e.key === "Escape") $("deleteModal").classList.add("hidden");
-    return;
-  }
-  if (!$("exportModal").classList.contains("hidden")) {
-    if (e.key === "Escape") $("exportModal").classList.add("hidden");
+  // an open modal owns the keyboard: Esc closes it, nothing else gets through
+  // to the grid (culling hotkeys must not fire at a photo you can't see)
+  const modal = openModal();
+  if (modal) {
+    if (e.key === "Escape") hideModal(modal);
     return;
   }
   if (inField(e)) {
@@ -1877,7 +1878,7 @@ document.addEventListener("keydown", (e) => {
     case "x": clearCompare("Compare cleared"); return;
     case "t": cycleFilter(); return;
     case "b": toggleMouseMode(); return;
-    case "v": case "?": $("help").classList.remove("hidden"); return;
+    case "v": case "?": showModal("help"); return;
   }
 });
 
@@ -2017,7 +2018,7 @@ function openExport() {
   $("exProgress").classList.add("hidden");
   $("exProgressBar").style.width = "0%";
   $("exProgressLabel").textContent = "";
-  $("exportModal").classList.remove("hidden");
+  showModal("exportModal");
 }
 
 // Set of paths currently checked for deletion in the delete modal.
@@ -2055,8 +2056,8 @@ function openDeleteModal() {
 
   updateDelCount();
   $("delStatus").textContent = "";
-  $("exportModal").classList.add("hidden");
-  $("deleteModal").classList.remove("hidden");
+  hideModal("exportModal");
+  showModal("deleteModal");
 }
 
 function toggleDelSelect(path, cell) {
@@ -2099,12 +2100,12 @@ async function confirmDelete() {
     let msg = `Deleted ${res.deleted} file${res.deleted === 1 ? "" : "s"} (${res.method.replace("_", " ")}).`;
     if (res.errors.length) msg += `\n${res.errors.length} errors:\n` + res.errors.slice(0, 5).join("\n");
     toast(`Deleted ${res.deleted} rejected`);
-    $("deleteModal").classList.add("hidden");
+    hideModal("deleteModal");
     $("exStatus").textContent = msg;
     reloadFolder();  // refresh library
   } catch (e) {
     $("delStatus").textContent = "Error: " + e.message;
-    if (/count changed/.test(e.message)) { $("deleteModal").classList.add("hidden"); reloadFolder(); }
+    if (/count changed/.test(e.message)) { hideModal("deleteModal"); reloadFolder(); }
   }
 }
 
@@ -2289,7 +2290,7 @@ $("treeOpenBtn").addEventListener("click", () => {
 $("browseBtn").addEventListener("click", browseFolder);
 $("reloadBtn").addEventListener("click", reloadFolder);
 $("delRejected").addEventListener("click", openDeleteModal);
-$("delCancel").addEventListener("click", () => $("deleteModal").classList.add("hidden"));
+$("delCancel").addEventListener("click", () => hideModal("deleteModal"));
 $("delConfirm").addEventListener("click", confirmDelete);
 $("delSelectAll").addEventListener("click", () => delSetAll(true));
 $("delSelectNone").addEventListener("click", () => delSetAll(false));
@@ -2297,9 +2298,9 @@ $("exBrowse").addEventListener("click", async () => {
   const folder = await pickFolder();
   if (folder) $("exDest").value = folder;
 });
-$("helpBtn").addEventListener("click", () => $("help").classList.remove("hidden"));
+$("helpBtn").addEventListener("click", () => showModal("help"));
 $("mouseBtn").addEventListener("click", () => toggleMouseMode());
-$("helpClose").addEventListener("click", () => $("help").classList.add("hidden"));
+$("helpClose").addEventListener("click", () => hideModal("help"));
 $("filterSel").addEventListener("change", (e) => { S.filter = e.target.value; applyFilter(); });
 $("typeSel").addEventListener("change", (e) => { S.typeFilter = e.target.value; applyFilter(); });
 $("sortSel").addEventListener("change", (e) => { S.sortKey = e.target.value; sortPhotos(); });
@@ -2315,7 +2316,7 @@ $("groupRaw").addEventListener("change", (e) => {
   applyFilter();
 });
 $("exportBtn").addEventListener("click", openExport);
-$("exCancel").addEventListener("click", () => $("exportModal").classList.add("hidden"));
+$("exCancel").addEventListener("click", () => hideModal("exportModal"));
 $("exRun").addEventListener("click", runExport);
 $("exCompress").addEventListener("change", (e) => {
   document.querySelector(".exq").classList.toggle("hidden", !e.target.checked);
@@ -2388,7 +2389,7 @@ updatePasteBtn();
 
 // ---- date split ----
 $("splitBtn").addEventListener("click", openSplit);
-$("spCancel").addEventListener("click", () => $("splitModal").classList.add("hidden"));
+$("spCancel").addEventListener("click", () => hideModal("splitModal"));
 $("spRun").addEventListener("click", runSplit);
 $("spBrowse").addEventListener("click", async () => {
   const folder = await pickFolder();

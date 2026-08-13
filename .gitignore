@@ -3,3 +3,10 @@ __pycache__/
 .venv/
 venv/
 _gen_test.py
+
+# local editor/agent state
+.claude/settings.local.json
+
+# app data, if anyone ever points PHOTO_CULLER_HOME at the repo
+.photo_culler/
+*.part

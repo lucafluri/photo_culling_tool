@@ -145,9 +145,25 @@ every hotkey acts on it instead of the keyboard cursor. Hover, tap `E`/`Q`/a
 rating, move to the next. There's no auto-advance in this mode since the mouse is
 your nav.
 
+## Development
+
+```bash
+python test_edits.py   # the edit pipeline (rotate/crop/tone/border maths)
+python test_api.py     # the HTTP API end to end, on a throwaway library
+```
+
+`test_api.py` boots the real app on port 8123 with `PHOTO_CULLER_HOME` pointed
+at a temp directory, so it can never touch your own DB or cache. Set that
+variable yourself if you want a scratch library:
+
+```bash
+PHOTO_CULLER_HOME=/tmp/culler-scratch python app.py
+```
+
 ## How it stores things
 
-- Marks and last-opened folder: `~/.photo_culler/culler.db` (SQLite).
+- Marks and last-opened folder: `~/.photo_culler/culler.db` (SQLite), or
+  `$PHOTO_CULLER_HOME` if set.
 - Thumbnail/preview cache: `~/.photo_culler/cache/` (safe to delete anytime, it
   regenerates). Trimmed to 2 GB on startup, oldest renders first.
 - Rescanning a folder drops DB entries for files that no longer exist on disk,

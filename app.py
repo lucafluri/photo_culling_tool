@@ -23,6 +23,7 @@ import sqlite3
 import threading
 import webbrowser
 from collections import OrderedDict
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -57,7 +58,9 @@ except Exception:  # pragma: no cover - optional
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
-APP_HOME = Path.home() / ".photo_culler"
+# PHOTO_CULLER_HOME redirects the DB and cache — tests point it at a temp dir
+# so they can never touch a real library.
+APP_HOME = Path(os.environ.get("PHOTO_CULLER_HOME") or Path.home() / ".photo_culler")
 CACHE_DIR = APP_HOME / "cache"
 DB_PATH = APP_HOME / "culler.db"
 APP_HOME.mkdir(parents=True, exist_ok=True)
@@ -88,10 +91,20 @@ PHOTO_COLS = "path, filename, folder, flag, rating, mtime, size, taken, edits"
 _db_lock = threading.Lock()
 
 
+@contextmanager
 def db():
+    """A connection that commits on a clean exit and always closes.
+
+    sqlite3's own context manager commits but leaves the connection open, so
+    every `with db() as conn` used to leak a handle until GC got round to it.
+    """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -510,7 +523,8 @@ def scan_folder(folder, recursive):
     with db() as conn:
         existing = {
             r["path"]: (r["mtime"], r["taken"])
-            for r in conn.execute("SELECT path, mtime, taken FROM photos").fetchall()
+            for r in conn.execute(
+                "SELECT path, mtime, taken FROM photos WHERE folder=?", (folder,))
         }
 
     with _db_lock, db() as conn:
@@ -541,14 +555,13 @@ def scan_folder(folder, recursive):
 
     # Drop rows for files that vanished from disk (deleted/moved outside the
     # app). Without this a restore lists them again with broken thumbnails, and
-    # export/delete keep trying to touch paths that aren't there.
-    with _db_lock, db() as conn:
-        stale = [
-            (r["path"],)
-            for r in conn.execute("SELECT path FROM photos WHERE folder=?", (folder,))
-            if not os.path.isfile(r["path"])
-        ]
-        if stale:
+    # export/delete keep trying to touch paths that aren't there. Only rows this
+    # scan didn't see are checked, and only a missing file is dropped — a
+    # non-recursive rescan must not forget the subfolders it isn't looking at.
+    seen = set(found)
+    stale = [(p,) for p in existing if p not in seen and not os.path.isfile(p)]
+    if stale:
+        with _db_lock, db() as conn:
             conn.executemany("DELETE FROM photos WHERE path=?", stale)
 
     set_setting("last_folder", folder)
@@ -556,19 +569,61 @@ def scan_folder(folder, recursive):
     return list_photos(found)
 
 
+def current_folder(required=True):
+    """The open scan folder as an absolute path, or None if there isn't one.
+
+    Everything that acts in bulk (export, delete, split) scopes itself to this
+    so marks from other folders are never touched.
+    """
+    folder = get_setting("last_folder")
+    if folder and os.path.isdir(folder):
+        return os.path.abspath(folder)
+    if required:
+        raise HTTPException(status_code=400, detail="no folder open")
+    return None
+
+
+def repath_moved(moved, edits_baked=()):
+    """Point DB rows at files that moved on disk (export --move, date split).
+
+    `moved` is [(old, new)]; paths in `edits_baked` get their stored edits
+    dropped because the export already rendered them into the file.
+    """
+    if not moved:
+        return
+    baked = set(edits_baked)
+    with _db_lock, db() as conn:
+        for old, new in moved:
+            conn.execute("DELETE FROM photos WHERE path=?", (new,))
+            conn.execute(
+                "UPDATE photos SET path=?, folder=?, filename=? WHERE path=?",
+                (new, os.path.dirname(new), os.path.basename(new), old),
+            )
+            if new in baked:
+                conn.execute("UPDATE photos SET edits=NULL WHERE path=?", (new,))
+
+
 def list_photos(paths):
+    """Rows for `paths`, in that order.
+
+    Chunked to stay under SQLite's variable limit — one query per 500 files
+    instead of the one-SELECT-per-file this used to do (a 3000-shot folder
+    meant 3000 round trips on every scan).
+    """
     if not paths:
         return []
-    out = []
+    found = {}
     with db() as conn:
-        for p in paths:
-            row = conn.execute(
-                f"SELECT {PHOTO_COLS} FROM photos WHERE path=?",
-                (p,),
-            ).fetchone()
-            if row:
-                out.append(dict(row))
-    return out
+        for i in range(0, len(paths), 500):
+            chunk = paths[i:i + 500]
+            rows = conn.execute(
+                "SELECT {} FROM photos WHERE path IN ({})".format(
+                    PHOTO_COLS, ",".join("?" * len(chunk))),
+                chunk,
+            )
+            for r in rows:
+                found[r["path"]] = dict(r)
+    return [found[p] for p in paths if p in found]
 
 
 # ----------------------------------------------------------------------------
@@ -661,11 +716,11 @@ def index():
 
 @app.get("/api/state")
 def api_state():
-    folder = get_setting("last_folder")
+    # a folder that's gone (drive unplugged, renamed) reports as none rather
+    # than showing a dead path as if it were open
+    folder = current_folder(required=False)
     recursive = get_setting("last_recursive", True)
     photos = []
-    if folder and not os.path.isdir(folder):
-        folder = None      # drive unplugged / folder gone: don't show a dead path
     if folder:
         with db() as conn:
             rows = conn.execute(
@@ -912,10 +967,7 @@ def api_save_copy(req: SaveCopyReq):
 
 @app.post("/api/split-by-date")
 def api_split(req: SplitReq):
-    folder = get_setting("last_folder")
-    if not folder or not os.path.isdir(folder):
-        raise HTTPException(status_code=400, detail="no folder open")
-    folder = os.path.abspath(folder)
+    folder = current_folder()
     dest_root = os.path.abspath(req.dest) if req.dest else folder
     fmt = {"day": "%Y-%m-%d", "month": "%Y-%m", "year": "%Y"}.get(req.granularity)
     if not fmt:
@@ -956,15 +1008,7 @@ def api_split(req: SplitReq):
         except Exception as e:  # noqa
             errors.append("{}: {}".format(src, e))
 
-    if moved:
-        with _db_lock, db() as conn:
-            for old, new in moved:
-                conn.execute("DELETE FROM photos WHERE path=?", (new,))
-                conn.execute(
-                    "UPDATE photos SET path=?, folder=?, filename=? WHERE path=?",
-                    (new, os.path.dirname(new), os.path.basename(new), old),
-                )
-
+    repath_moved(moved)
     return {"moved": done, "action": req.action, "dest": dest_root, "errors": errors}
 
 
@@ -1006,10 +1050,7 @@ def api_export(req: ExportReq):
     dest = os.path.abspath(req.dest)
     os.makedirs(dest, exist_ok=True)
 
-    folder = get_setting("last_folder")
-    if not folder:
-        raise HTTPException(status_code=400, detail="no folder open")
-    folder = os.path.abspath(folder)
+    folder = current_folder()
     with db() as conn:
         if req.selection == "keep":
             rows = conn.execute(
@@ -1108,18 +1149,7 @@ def api_export(req: ExportReq):
                 "name": name_display, "error": False
             }) + "\n\n"
 
-        # DB fixups for moved files
-        if moved:
-            with _db_lock, db() as conn:
-                for old, new in moved:
-                    conn.execute("DELETE FROM photos WHERE path=?", (new,))
-                    conn.execute(
-                        "UPDATE photos SET path=?, folder=?, filename=? WHERE path=?",
-                        (new, os.path.dirname(new), os.path.basename(new), old),
-                    )
-                    if new in baked:
-                        conn.execute("UPDATE photos SET edits=NULL WHERE path=?", (new,))
-
+        repath_moved(moved, baked)
         yield "data: " + json.dumps({
             "type": "done", "exported": done, "dest": dest,
             "action": req.action, "files": files, "errors": errors
@@ -1131,8 +1161,7 @@ def api_export(req: ExportReq):
 @app.post("/api/delete-rejected")
 def api_delete_rejected(req: DeleteReq):
     # scope to the open folder so stale rejects from past folders are untouched
-    folder = get_setting("last_folder")
-    folder = os.path.abspath(folder) if folder else None
+    folder = current_folder()
     with db() as conn:
         rows = conn.execute(
             "SELECT path FROM photos WHERE flag=-1 AND folder=?", (folder,)).fetchall()
