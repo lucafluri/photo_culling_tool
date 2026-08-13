@@ -27,6 +27,13 @@ const S = {
 };
 
 const $ = (id) => document.getElementById(id);
+
+// Filenames, EXIF strings and export paths all end up inside innerHTML and all
+// come from disk — a file called `a<b>&c.jpg` must not become markup.
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
 const grid = $("grid");
 const viewer = $("viewer");
 const panesEl = $("panes");
@@ -93,8 +100,10 @@ function typeGroup(ext) {
 }
 
 function ingest(photos) {
-  // a fresh folder load starts with no carried-over compare selection
+  // a fresh folder load starts with no carried-over compare selection, and no
+  // mark-undo history pointing at the previous folder's photos
   S.compare = [];
+  markHist.length = 0;
   S.cursor = 0;
   S.photos = photos;
   S.byPath = new Map();
@@ -344,7 +353,7 @@ function typeBadge(p) {
     if (p.hasStd) parts.push("JPG");
     if (p.hasRaw) parts.push("RAW");
     if (p.hasHeic) parts.push("HEIC");
-    const title = p.groupExts.join(", ");
+    const title = escapeHtml(p.groupExts.join(", "));
     return `<div class="typebadge combo" title="${title}">${parts.join("+")}</div>`;
   }
   const g = typeGroup(p.ext);
@@ -372,7 +381,7 @@ function renderGrid() {
     const cmpIdx = S.compare.indexOf(p.path);
     cell.innerHTML =
       `<img data-src="${thumbUrl(p.path)}" alt="" />` +
-      `<div class="name">${p.filename}</div>` +
+      `<div class="name">${escapeHtml(p.filename)}</div>` +
       typeBadge(p) +
       (p.edits ? `<div class="editbadge" title="Edited">✎</div>` : "") +
       (cmpIdx >= 0 ? `<div class="cmpnum">${cmpIdx + 1}</div>` : "") +
@@ -396,7 +405,9 @@ function refreshCell(i) {
   const cell = grid.querySelector(`.cell[data-i="${i}"]`);
   if (!cell) return;
   const p = S.view[i];
-  cell.className = cellClass(p) + (i === S.cursor ? " sel" : "");
+  // rebuilding className would drop the mouse-mode hover outline mid-cull
+  cell.className = cellClass(p) + (i === S.cursor ? " sel" : "") +
+    (i === S.hover && S.mouseMode ? " hover" : "");
   const cmpIdx = S.compare.indexOf(p.path);
   if (cmpIdx >= 0) cell.classList.add("cmp");
   cell.querySelector(".stars").textContent = starStr(p.rating);
@@ -458,12 +469,12 @@ function setHover(i) {
   }
 }
 
-function toggleMouseMode(on) {
+function toggleMouseMode(on, quiet) {
   S.mouseMode = (on === undefined) ? !S.mouseMode : !!on;
   document.body.classList.toggle("mousemode", S.mouseMode);
   $("mouseBtn").classList.toggle("active", S.mouseMode);
   if (!S.mouseMode) setHover(null);
-  toast(S.mouseMode ? "Mouse mode ON — hotkeys act on the hovered photo" : "Mouse mode off");
+  if (!quiet) toast(S.mouseMode ? "Mouse mode ON — hotkeys act on the hovered photo" : "Mouse mode off");
 }
 
 // ---------------------------------------------------------------------------
@@ -626,8 +637,8 @@ function pickBest(idx) {
 function openCompare() {
   let paths = S.compare.slice();
   if (paths.length < 2) {
-    // fall back to current + next few
-    const start = S.cursor;
+    // fall back to the active photo + the next one (hovered cell in mouse mode)
+    const start = activeIndex();
     paths = S.view.slice(start, start + 2).map((p) => p.path);
   }
   if (paths.length < 1) return;
@@ -919,11 +930,12 @@ async function renderMeta() {
       ["Aperture", m.aperture],
       ["ISO", m.iso && String(m.iso).replace(/^ISO /, "")],
       ["Size", m.width ? `${m.width} × ${m.height}` : null],
-      ["File", (m.size / 1048576).toFixed(1) + " MB"],
+      ["File", m.size >= 1048576 ? (m.size / 1048576).toFixed(1) + " MB"
+                                 : Math.round(m.size / 1024) + " KB"],
       ["Taken", p.taken ? new Date(p.taken * 1000).toLocaleString() : null],
     ].filter(([, v]) => v);
     el.innerHTML = rows.map(([k, v]) =>
-      `<div class="mrow"><span class="mkey">${k}</span><span>${v}</span></div>`).join("") ||
+      `<div class="mrow"><span class="mkey">${k}</span><span>${escapeHtml(v)}</span></div>`).join("") ||
       `<div class="mrow"><span class="mkey">No EXIF data</span></div>`;
   } catch (e) {
     el.innerHTML = `<div class="mrow"><span class="mkey">No EXIF data</span></div>`;
@@ -1115,7 +1127,7 @@ function renderViewerMeta() {
     const flag = p.flag === 1 ? `<span class="pflag keep">KEEP</span>`
       : p.flag === -1 ? `<span class="pflag reject">REJECT</span>` : "";
     pane._label.innerHTML =
-      `<span class="nm">${typeBadge(p)}${p.filename}</span>` +
+      `<span class="nm">${typeBadge(p)}${escapeHtml(p.filename)}</span>` +
       `<span>${flag} <span class="stars" style="color:var(--star)">${starStr(p.rating)}</span></span>`;
     pane.classList.toggle("cur", v.mode === "compare" && idx === v.cur);
   });
@@ -1126,15 +1138,16 @@ function updateHud() {
   const v = S.viewer; if (!v) return;
   if (v.mode === "tournament") {
     const l = S.byPath.get(v.left), r = S.byPath.get(v.right);
+    const nm = (x) => (x ? escapeHtml(x.filename) : "");
     $("viewerHud").innerHTML =
-      `<span>Which is better? <b>${l ? l.filename : ""}</b> vs <b>${r ? r.filename : ""}</b></span>` +
+      `<span>Which is better? <b>${nm(l)}</b> vs <b>${nm(r)}</b></span>` +
       `<span>match ${v.round}/${v.total} · ←/S = left · →/F = right · Esc cancels</span>`;
     return;
   }
   const p = currentPhoto();
   const pos = v.mode === "loupe" ? `${v.cur + 1}/${v.paths.length}` : `compare ${v.paths.length}`;
   $("viewerHud").innerHTML =
-    `<span>${p ? p.filename : ""}</span>` +
+    `<span>${p ? escapeHtml(p.filename) : ""}</span>` +
     `<span>${pos} · zoom ${(v.zoom).toFixed(1)}× · scroll=zoom drag=pan · Esc to close</span>`;
 }
 
@@ -1407,10 +1420,6 @@ function updatePasteBtn() {
 // ---- named presets: save the current edit stack, apply it later — either to
 // the photo being edited, or to a whole grid selection. Stored in localStorage
 // since they're just reusable templates, not per-photo state. ----
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
 function loadPresets() {
   try { return JSON.parse(localStorage.getItem("editPresets") || "[]"); }
   catch (e) { return []; }
@@ -1486,6 +1495,7 @@ function fineCommit() {
   syncGridOverlay();   // drop the forced grid if the toggle is off
   if (!S.editor) return;
   const v = Math.round(parseFloat($("fineR").value) * 10) / 10;
+  $("fineRNum").value = v;   // keep the readout right after a programmatic reset
   const cur = curEdits();
   if (v === (cur.fine || 0)) { renderEditPreview(); return; }   // unchanged — settle back
   const n = clone(cur);
@@ -1521,6 +1531,7 @@ function borderCommit() {
   borderDragging = false;
   if (!S.editor) return;
   const w = parseFloat($("borderW").value);
+  $("borderWNum").value = Math.round(w * 1000) / 10;   // ditto for the % readout
   const cur = curEdits();
   const prev = cur.border || {};
   if (w === (prev.w || 0) && (!w || $("borderC").value === prev.color)) {
@@ -1581,6 +1592,10 @@ function sliderInput(inp) {
 }
 function sliderCommit(inp) {
   sliderDragging = false;
+  // the slider may have been set programmatically (double-click reset), so the
+  // numeric twin has to be re-synced here, not only while dragging
+  const num = inp.parentElement.querySelector("input.num");
+  if (num) num.value = parseFloat(inp.value).toFixed(2);
   const n = clone(curEdits());
   const val = parseFloat(inp.value);
   const key = inp.dataset.edit;
@@ -1775,7 +1790,11 @@ document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") $("exportModal").classList.add("hidden");
     return;
   }
-  if (inField(e)) return;
+  if (inField(e)) {
+    // Esc must always get you out — otherwise a focused slider traps the viewer
+    if (e.key === "Escape") { e.target.blur(); if (S.viewer) closeViewer(); }
+    return;
+  }
 
   const k = e.key.toLowerCase();
   const inViewer = !!S.viewer;
@@ -1964,11 +1983,13 @@ function renderExFiles(verb, files, errors) {
   files = files || []; errors = errors || [];
   if (!files.length && !errors.length) { el.classList.add("hidden"); el.innerHTML = ""; return; }
   let h = `<div class="exhead">${verb} ${files.length} file${files.length === 1 ? "" : "s"}:</div>`;
-  h += files.map((f) =>
-    `<div class="exrow"><span class="exname">${f.name}</span>` +
-    (f.compressed ? `<span class="excomp">compressed</span>` : "") +
-    `<span class="expath" title="${f.dest}">${f.dest}</span></div>`).join("");
-  if (errors.length) h += errors.map((e) => `<div class="exrow err">⚠ ${e}</div>`).join("");
+  h += files.map((f) => {
+    const dest = escapeHtml(f.dest);
+    return `<div class="exrow"><span class="exname">${escapeHtml(f.name)}</span>` +
+      (f.compressed ? `<span class="excomp">compressed</span>` : "") +
+      `<span class="expath" title="${dest}">${dest}</span></div>`;
+  }).join("");
+  if (errors.length) h += errors.map((e) => `<div class="exrow err">⚠ ${escapeHtml(e)}</div>`).join("");
   el.innerHTML = h;
   el.classList.remove("hidden");
 }
@@ -2026,7 +2047,7 @@ function openDeleteModal() {
       `<img loading="lazy" src="${thumbUrl(p.path)}" alt="" />` +
       `<div class="del-check">🗑</div>` +
       typeBadge(p) +
-      `<div class="del-name">${p.filename}</div>`;
+      `<div class="del-name">${escapeHtml(p.filename)}</div>`;
     cell.addEventListener("click", () => toggleDelSelect(p.path, cell));
     frag.appendChild(cell);
   });
@@ -2128,6 +2149,7 @@ function buildCrumb(path) {
   // Split into segments
   const norm = path.replace(/\\/g, "/");
   const parts = norm.replace(/\/$/, "").split("/").filter(Boolean);
+  const sep = path.includes("\\") ? "\\" : "/";   // POSIX paths keep their "/"
 
   crumb.innerHTML = "";
   // Build cumulative paths
@@ -2137,10 +2159,11 @@ function buildCrumb(path) {
     const isWinDrive = /^[A-Za-z]:$/.test(seg);
     if (i === 0 && isWinDrive) {
       cumulative.push(seg + "\\");
+    } else if (i === 0) {
+      cumulative.push(sep === "/" ? "/" + seg : seg);
     } else {
       const prev = cumulative[i - 1] || "";
-      const sep = prev.endsWith("\\") ? "" : "\\";
-      cumulative.push(prev + sep + seg);
+      cumulative.push(prev.endsWith(sep) ? prev + seg : prev + sep + seg);
     }
     if (i > 0) {
       const s = document.createElement("span");
@@ -2309,7 +2332,11 @@ $("sidebarToggle").addEventListener("click", toggleSidebar);
 $("editBar").querySelectorAll("input[data-edit]").forEach((inp) => {
   inp.addEventListener("input", () => sliderInput(inp));
   inp.addEventListener("change", () => sliderCommit(inp));
-  inp.addEventListener("dblclick", () => { inp.value = 1; sliderCommit(inp); });
+  // reset to this slider's own neutral: 1 for the multipliers, 0 for WB
+  inp.addEventListener("dblclick", () => {
+    inp.value = neutralOf(inp.dataset.edit);
+    sliderCommit(inp);
+  });
 });
 // numeric twin of each tonal slider: type an exact value, Enter/blur commits
 $("editBar").querySelectorAll("input.num[data-num]").forEach((num) => {
@@ -2463,4 +2490,4 @@ function toggleSidebar() {
 }
 
 restore();
-toggleMouseMode(true);
+toggleMouseMode(true, true);   // default on, without shouting about it at load

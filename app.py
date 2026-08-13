@@ -28,7 +28,8 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
+                               StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -73,6 +74,7 @@ ALL_EXTS = STD_EXTS | HEIC_EXTS | RAW_EXTS
 
 THUMB_SIZE = 480       # grid thumbnails (long edge, px)
 PREVIEW_SIZE = 2400    # loupe/compare preview (long edge, px)
+CACHE_BUDGET = 2 * 1024 ** 3   # prune the render cache back to this at startup
 
 # Column list returned to the UI; one source so the two photo SELECTs can't drift.
 PHOTO_COLS = "path, filename, folder, flag, rating, mtime, size, taken, edits"
@@ -360,6 +362,60 @@ def _cache_file(path, mtime, size_tag, edits_tag=""):
     return CACHE_DIR / "{}_{}.jpg".format(size_tag, h)
 
 
+def _save_cache_jpeg(img, out, **kw):
+    """Write a cache JPEG atomically.
+
+    Renders run in a thread pool, so a second request can hit `out.exists()`
+    while the first is still writing; without the rename it would serve (and
+    the browser would cache) a truncated image.
+    """
+    tmp = out.with_name("{}.{}.part".format(out.name, threading.get_ident()))
+    try:
+        img.save(tmp, "JPEG", **kw)
+        os.replace(str(tmp), str(out))
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def prune_cache(budget=CACHE_BUDGET):
+    """Drop the oldest cache renders until the cache fits in `budget` bytes.
+
+    Every slider commit bakes a new preview, so an editing session can add
+    hundreds of MB; nothing else ever deletes them.
+    """
+    files, total = [], 0
+    for f in CACHE_DIR.iterdir():
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        if f.suffix == ".part":      # leftover from an interrupted render
+            try:
+                f.unlink()
+            except OSError:
+                pass
+            continue
+        files.append((st.st_mtime, st.st_size, f))
+        total += st.st_size
+    if total <= budget:
+        return 0
+    files.sort()
+    freed = 0
+    for _mt, size, f in files:
+        if total - freed <= budget:
+            break
+        try:
+            f.unlink()
+            freed += size
+        except OSError:
+            pass
+    return freed
+
+
 _NO_EDITS = object()   # sentinel: "look up stored edits" vs an explicit (maybe {}) override
 
 # RAM cache of un-edited preview-size base images, so live editor renders skip
@@ -383,6 +439,12 @@ def _preview_base(path, mtime):
     return img
 
 
+# A full-res decode is hundreds of MB for a 45MP RAW and the grid fires dozens
+# of thumbnail requests at once; without a cap the thread pool decodes 40 in
+# parallel and the process balloons.
+_render_sem = threading.Semaphore(max(2, min(8, os.cpu_count() or 4)))
+
+
 def get_rendered(path, long_edge, size_tag, edits=_NO_EDITS):
     """Generate (or fetch from cache) a JPEG resized to `long_edge`. Returns Path.
 
@@ -396,20 +458,27 @@ def get_rendered(path, long_edge, size_tag, edits=_NO_EDITS):
     live = edits is not _NO_EDITS
     if not live:
         edits = get_edits(path)
-    out = _cache_file(path, st.st_mtime, size_tag, _edits_tag(edits))
+    tag = _edits_tag(edits)
+    out = _cache_file(path, st.st_mtime, size_tag, tag)
     if out.exists():
         return out
     if live and size_tag == "preview":
         # ponytail: live editor renders edit a RAM-cached 2400px base and skip
         # `optimize` — a heavy crop previews below full detail until the stored
-        # render (full-res path below) replaces it after commit/navigation
-        img = _apply_edits(_preview_base(path, st.st_mtime), edits)
-        img.save(out, "JPEG", quality=86)
-        return out
-    img = _load_pil(path)
-    img = _apply_edits(img, edits)
-    img.thumbnail((long_edge, long_edge), Image.LANCZOS)
-    img.save(out, "JPEG", quality=86, optimize=True)
+        # render replaces it. It gets its own cache name so that quick draft
+        # never gets served later as the committed render for the same edits.
+        draft = _cache_file(path, st.st_mtime, "draft", tag)
+        if not draft.exists():
+            img = _apply_edits(_preview_base(path, st.st_mtime), edits)
+            _save_cache_jpeg(img, draft, quality=86)
+        return draft
+    with _render_sem:
+        if out.exists():        # another thread rendered it while we waited
+            return out
+        img = _load_pil(path)
+        img = _apply_edits(img, edits)
+        img.thumbnail((long_edge, long_edge), Image.LANCZOS)
+        _save_cache_jpeg(img, out, quality=86, optimize=True)
     return out
 
 
@@ -470,6 +539,18 @@ def scan_folder(folder, recursive):
                 (full, folder, os.path.basename(full), st.st_mtime, st.st_size, taken),
             )
 
+    # Drop rows for files that vanished from disk (deleted/moved outside the
+    # app). Without this a restore lists them again with broken thumbnails, and
+    # export/delete keep trying to touch paths that aren't there.
+    with _db_lock, db() as conn:
+        stale = [
+            (r["path"],)
+            for r in conn.execute("SELECT path FROM photos WHERE folder=?", (folder,))
+            if not os.path.isfile(r["path"])
+        ]
+        if stale:
+            conn.executemany("DELETE FROM photos WHERE path=?", stale)
+
     set_setting("last_folder", folder)
     set_setting("last_recursive", bool(recursive))
     return list_photos(found)
@@ -501,15 +582,15 @@ class OpenReq(BaseModel):
 
 class MarkReq(BaseModel):
     path: str
-    flag: int = None     # 1 keep, -1 reject, 0 none
-    rating: int = None   # 0..5
+    flag: Optional[int] = None     # 1 keep, -1 reject, 0 none
+    rating: Optional[int] = None   # 0..5
 
 
 class DeleteReq(BaseModel):
     confirm: bool = False
     expected_count: int = -1   # client echoes the count it warned about; must match
     permanent: bool = False    # force permanent delete even if recycle bin available
-    paths: List[str] = None    # explicit subset to delete; None = all rejected
+    paths: Optional[List[str]] = None   # explicit subset; None = all rejected
 
 
 class EditReq(BaseModel):
@@ -545,6 +626,22 @@ class ExportReq(BaseModel):
 app = FastAPI(title="Photo Culler")
 
 
+@app.middleware("http")
+async def block_cross_site_writes(request, call_next):
+    """Reject state-changing requests that came from another site.
+
+    The server listens on localhost, but any page the user visits can still
+    POST here from their browser — and these endpoints move and delete files.
+    Our own UI sends no Origin (same-origin fetch) or sends this host's.
+    """
+    origin = request.headers.get("origin")
+    if request.method != "GET" and origin:
+        host = request.headers.get("host", "")
+        if origin.split("//", 1)[-1] != host:
+            return JSONResponse({"detail": "cross-site request blocked"}, status_code=403)
+    return await call_next(request)
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
@@ -567,7 +664,9 @@ def api_state():
     folder = get_setting("last_folder")
     recursive = get_setting("last_recursive", True)
     photos = []
-    if folder and os.path.isdir(folder):
+    if folder and not os.path.isdir(folder):
+        folder = None      # drive unplugged / folder gone: don't show a dead path
+    if folder:
         with db() as conn:
             rows = conn.execute(
                 f"SELECT {PHOTO_COLS} FROM photos WHERE folder=? ORDER BY path",
@@ -614,7 +713,7 @@ def api_pick_folder():
 
 
 @app.get("/api/folder-tree")
-def api_folder_tree(path: str = Query(None)):
+def api_folder_tree(path: Optional[str] = Query(None)):
     """Return immediate subdirectories of `path` (or drive/home roots if omitted).
 
     Each entry: {name, path, has_children}.
@@ -679,7 +778,7 @@ def api_thumb(path: str = Query(...)):
 
 
 @app.get("/api/preview")
-def api_preview(path: str = Query(...), edits: str = Query(None)):
+def api_preview(path: str = Query(...), edits: Optional[str] = Query(None)):
     # `edits` (JSON) overrides stored edits for live editor previews; absent =
     # use the photo's stored edits.
     if edits is not None:
@@ -908,7 +1007,9 @@ def api_export(req: ExportReq):
     os.makedirs(dest, exist_ok=True)
 
     folder = get_setting("last_folder")
-    folder = os.path.abspath(folder) if folder else None
+    if not folder:
+        raise HTTPException(status_code=400, detail="no folder open")
+    folder = os.path.abspath(folder)
     with db() as conn:
         if req.selection == "keep":
             rows = conn.execute(
@@ -960,18 +1061,20 @@ def api_export(req: ExportReq):
             if bake and not is_jpeg:
                 name = os.path.splitext(name)[0] + ".jpg"
 
+            tdir = dest
             if req.keep_structure:
-                rel = os.path.join(
-                    os.path.dirname(os.path.relpath(src, r["folder"])), name)
-                target = os.path.join(dest, rel)
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-            else:
-                target = os.path.join(dest, name)
-                base_t, ext_t = os.path.splitext(target)
-                n = 1
-                while os.path.exists(target):
-                    target = "{}_{}{}".format(base_t, n, ext_t)
-                    n += 1
+                sub = os.path.dirname(os.path.relpath(src, r["folder"] or dest))
+                # a file that no longer lives under its scan root would relpath
+                # to "..\.." and write outside `dest` — flatten those instead
+                if not sub.startswith(".."):
+                    tdir = os.path.join(dest, sub)
+            os.makedirs(tdir, exist_ok=True)
+            target = os.path.join(tdir, name)
+            base_t, ext_t = os.path.splitext(target)
+            n = 1
+            while os.path.exists(target):   # never silently overwrite
+                target = "{}_{}{}".format(base_t, n, ext_t)
+                n += 1
 
             try:
                 if bake:
@@ -1088,6 +1191,7 @@ def main():
     host = "127.0.0.1"
     port = 8000
     url = "http://{}:{}".format(host, port)
+    threading.Thread(target=prune_cache, daemon=True).start()
     if "--no-browser" not in sys.argv:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     print("Photo Culler running at " + url)

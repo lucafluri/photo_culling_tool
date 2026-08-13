@@ -149,7 +149,9 @@ your nav.
 
 - Marks and last-opened folder: `~/.photo_culler/culler.db` (SQLite).
 - Thumbnail/preview cache: `~/.photo_culler/cache/` (safe to delete anytime, it
-  regenerates).
+  regenerates). Trimmed to 2 GB on startup, oldest renders first.
+- Rescanning a folder drops DB entries for files that no longer exist on disk,
+  so marks for deleted photos don't linger.
 
 ## Notes
 
