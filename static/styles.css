@@ -323,10 +323,24 @@ input[type=range].ticked:focus::-moz-range-thumb { outline: 2px solid var(--acce
 .histlegend .histghost { color: #fff; }
 .histchanges {
   margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--line);
-  font-size: 11px; color: var(--txt); max-height: 140px; overflow-y: auto;
+  font-size: 11px; color: var(--txt); max-height: 140px;
+  overflow-y: auto; overflow-x: hidden;
 }
 .hchg { padding: 1px 0; }
 .hchg.muted { color: var(--muted); }
+/* each listed change is a switch: click to park that one adjustment */
+.hchg.togglable { cursor: pointer; border-radius: 4px; padding: 1px 4px; }
+.hchg.togglable:hover { background: var(--panel); }
+.hchg.isoff { color: var(--muted); text-decoration: line-through; }
+.hchk { display: inline-block; width: 15px; color: var(--muted); }
+
+/* RAW output switches in the export dialog */
+.rawbox { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-top: 4px; }
+.rawbox-title {
+  color: var(--muted); font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px;
+}
+.rawbox .chk { display: block; margin: 2px 0; }
 
 .gridoverlay {
   position: absolute; inset: 0; z-index: 3; pointer-events: none;
@@ -343,6 +357,41 @@ input[type=range].ticked:focus::-moz-range-thumb { outline: 2px solid var(--acce
   position: absolute; border: 1px dashed #fff; background: #4a9eff22;
   box-shadow: 0 0 0 100vmax #0008; pointer-events: none;
 }
+
+/* retouch: dest circle solid, source circle dashed, a hairline between them */
+/* "still working" badge, shown only once a render is slow enough to notice */
+.panebusy {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  z-index: 8; padding: 9px 16px; border-radius: 8px;
+  display: flex; align-items: center; gap: 9px;
+  background: rgba(17, 17, 17, .85); border: 1px solid var(--line);
+  color: var(--txt); font-size: 13px; pointer-events: none;
+}
+.spinner {
+  width: 13px; height: 13px; border-radius: 50%; flex-shrink: 0;
+  border: 2px solid var(--line); border-top-color: var(--accent, #4a9eff);
+  animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.spotoverlay { position: absolute; inset: 0; z-index: 6; cursor: crosshair; }
+.spotsvg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+/* a committed region, drawn at brush width so it reads as the stroke it was */
+.spotregion {
+  fill: rgba(74, 158, 255, .18); stroke: rgba(74, 158, 255, .5);
+  stroke-linecap: round; stroke-linejoin: round;
+}
+polyline.spotregion { fill: none; }
+.spotpainting {
+  fill: rgba(255, 255, 255, .3); stroke: rgba(255, 255, 255, .45);
+  stroke-linecap: round; stroke-linejoin: round;
+}
+polyline.spotpainting { fill: none; }
+.spotsrc { fill: none; stroke: #4a9eff; stroke-width: 1.5; stroke-dasharray: 4 3; }
+.spotlink { stroke: rgba(255, 255, 255, .6); stroke-width: 1; stroke-dasharray: 2 3; }
+/* the brush itself, drawn under the pointer so its size is never a guess */
+.spotbrush { fill: rgba(255, 255, 255, .07); stroke: rgba(255, 255, 255, .8); stroke-width: 1.5; }
+.spotoverlay { cursor: none; }
 
 .metapanel {
   background: var(--panel); border: 1px solid var(--line); border-radius: 8px;

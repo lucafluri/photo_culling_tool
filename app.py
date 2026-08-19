@@ -19,6 +19,7 @@ import json
 import math
 import hashlib
 import shutil
+import socket
 import sqlite3
 import threading
 import webbrowser
@@ -34,7 +35,8 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from PIL import Image, ImageOps, ImageEnhance
+import numpy as np
+from PIL import Image, ImageDraw, ImageOps, ImageEnhance, ImageFilter
 import pillow_heif
 
 pillow_heif.register_heif_opener()
@@ -218,6 +220,22 @@ def capture_time(path, ext):
     return None
 
 
+def _load_raw_full(path):
+    """Full demosaic of a RAW file, for export.
+
+    `_load_pil` deliberately reads the embedded preview — that is what makes a
+    2000-shot RAW folder open in seconds — but the preview is a camera JPEG,
+    smaller than the sensor and already cooked by the camera. When the point of
+    the export is "give me the good version off the negative", decode properly.
+    """
+    if not HAVE_RAWPY:
+        return _load_pil(path)
+    with rawpy.imread(path) as raw:
+        rgb = raw.postprocess(use_camera_wb=True, output_bps=8)
+    img = Image.fromarray(rgb)
+    return img if img.mode == "RGB" else img.convert("RGB")
+
+
 def _compress_jpeg(src, target, quality):
     """Re-encode a JPEG at `quality`, preserving EXIF/ICC (and thus orientation).
 
@@ -237,7 +255,7 @@ def _compress_jpeg(src, target, quality):
         im.save(target, "JPEG", **kw)
 
 
-def _bake_to_jpeg(src, target, edits, quality):
+def _bake_to_jpeg(src, target, edits, quality, raw_full=False):
     """Render `src` with `edits` baked in and write a JPEG to `target`.
 
     Pixels are oriented and edited (rotate/flip/crop/tone applied); EXIF is
@@ -245,7 +263,7 @@ def _bake_to_jpeg(src, target, edits, quality):
     already-rotated image. Used by export so the exported file matches the
     edited preview.
     """
-    img = _load_pil(src)            # oriented RGB, RAW/HEIC handled
+    img = _load_raw_full(src) if raw_full else _load_pil(src)
     img = _apply_edits(img, edits)
     exif = img.getexif()
     exif.pop(0x0112, None)          # Orientation — already baked into the pixels
@@ -254,6 +272,66 @@ def _bake_to_jpeg(src, target, edits, quality):
     if icc:
         kw["icc_profile"] = icc
     img.save(target, "JPEG", **kw)
+
+
+_XMP = """<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:culler="https://photo-culler.local/ns/1.0/"
+    xmp:Rating="{rating}"
+    xmp:Label="{label}"
+    culler:Edits="{edits}"
+    culler:Changes="{changes}" />
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>
+"""
+
+
+def _describe_edits(edits):
+    """Short human-readable list of what the edit stack does, for the sidecar."""
+    if not edits:
+        return "none"
+    out = []
+    for key, val in sorted(edits.items()):
+        if key == "off":            # parked adjustments aren't applied
+            continue
+        if key == "border":
+            out.append("border {:.0%}".format(float(val.get("w", 0) or 0)))
+        elif key == "crop":
+            out.append("cropped")
+        elif key == "spots":
+            out.append("retouch {} spot(s)".format(len(val or ())))
+        elif isinstance(val, bool):
+            if val:
+                out.append(key)
+        else:
+            out.append("{} {}".format(key, val))
+    return ", ".join(out)
+
+
+def _write_xmp_sidecar(target, edits, rating, flag):
+    """Write `<target>.xmp` beside an exported RAW.
+
+    A RAW cannot carry baked pixels, so "export the RAW with my changes" means
+    the negative plus a record of the changes. The rating and keep/reject label
+    go in standard XMP so other software reads them; the edit stack goes in our
+    own namespace, which is the only place it could be round-tripped from.
+    """
+    from xml.sax.saxutils import escape
+    edits = applied_edits(edits)      # parked adjustments are not changes
+    body = _XMP.format(
+        rating=int(rating or 0),
+        label={1: "Keep", -1: "Reject"}.get(int(flag or 0), ""),
+        edits=escape(json.dumps(edits or {}, sort_keys=True), {'"': "&quot;"}),
+        changes=escape(_describe_edits(edits), {'"': "&quot;"}),
+    )
+    path = target + ".xmp"
+    with io.open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    return path
 
 
 def _max_inscribed(w, h, angle):
@@ -274,16 +352,418 @@ def _max_inscribed(w, h, angle):
     return wr, hr
 
 
-def _apply_edits(img, edits):
-    """Apply non-destructive edits (rotate/flip/crop/enhance/border) to a PIL image.
+# ----------------------------------------------------------------------------
+# Edit pipeline pieces
+#
+# Everything below takes a PIL image and returns a new one — `_apply_edits`
+# must never mutate its input, because the live-preview base cache hands the
+# same image object to every request for that photo.
+# ----------------------------------------------------------------------------
 
-    `edits` is the dict stored per-photo; falsy = original. Order: orient (90°
-    steps + flips, lossless), fine rotation (straighten, auto-cropped to the
-    largest inscribed rect), then crop (normalized 0..1 of the rotated frame),
-    then tonal enhancements, then border (last, so its color is exact). Crop
-    coords live in the rotated frame so the UI can draw the crop box on the
-    already-rotated preview.
+def _f(edits, key, default=0.0):
+    """Float out of the edits dict, tolerating nulls and strings from JSON."""
+    try:
+        v = edits.get(key)
+        return default if v is None else float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _by_strips(img, fn, rows=2048):
+    """Run a numpy op band by band.
+
+    A 45MP frame is 540 MB as float32 and these ops need several temporaries at
+    once; up to `_render_sem` of them run in parallel. Bands keep the peak flat.
+    `fn(sub, y_offset, full_height)` gets where its band sits in the whole frame.
     """
+    W, H = img.size
+    if H <= rows:
+        return fn(img, 0, H)
+    out = Image.new("RGB", (W, H))
+    for y in range(0, H, rows):
+        y1 = min(H, y + rows)
+        out.paste(fn(img.crop((0, y, W, y1)), y, H), (0, y))
+    return out
+
+
+def _tone_lut(exposure, hi, sh, wh, bl):
+    """256-entry curve for exposure + highlights/shadows/whites/blacks.
+
+    One lookup table instead of four passes: these are all per-pixel tone moves,
+    so they compose into a single curve that PIL applies in C. Highlights and
+    shadows use bell masks that vanish at both ends (so pure black stays black);
+    whites and blacks push the ends themselves. Exposure is a linear-light
+    multiply, which is what makes it read as stops rather than as brightness.
+    """
+    lut = []
+    for i in range(256):
+        v = i / 255.0
+        if exposure:
+            lin = (v / 12.92) if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+            lin = min(1.0, max(0.0, lin * (2.0 ** exposure)))
+            v = (lin * 12.92) if lin <= 0.0031308 else (1.055 * lin ** (1 / 2.4) - 0.055)
+        v0, out = v, v
+        if sh:
+            out += 0.40 * sh * 4.0 * v0 * (1 - v0) ** 2
+        if hi:
+            out += 0.40 * hi * 4.0 * (1 - v0) * v0 ** 2
+        if bl:
+            out += 0.25 * bl * (1 - v0) ** 2
+        if wh:
+            out += 0.25 * wh * v0 ** 2
+        lut.append(int(round(min(1.0, max(0.0, out)) * 255)))
+    return lut
+
+
+def _vibrance(img, amt):
+    """Saturation weighted by how unsaturated a pixel already is.
+
+    Skin and other already-saturated colours barely move, which is the whole
+    point of having this next to the flat `saturation` control.
+    """
+    def band(sub, _y, _h):
+        # saturation comes off the uint8 view (cheap min/max, no big temporary);
+        # only the blend needs floats
+        u8 = np.asarray(sub)
+        mx = u8.max(2).astype(np.float32)
+        sat = 1.0 - u8.min(2) / np.maximum(mx, 1e-6)
+        arr = u8.astype(np.float32)
+        lum = arr @ np.array([0.299, 0.587, 0.114], np.float32)
+        out = lum[..., None] + (arr - lum[..., None]) * (1.0 + amt * (1.0 - sat))[..., None]
+        return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
+    return _by_strips(img, band)
+
+
+def _vignette(img, amt):
+    """Radial gain. Positive darkens the corners, negative corrects lens falloff."""
+    W, H = img.size
+    cx, cy = (W - 1) / 2.0, (H - 1) / 2.0
+    rx, ry = max(cx, 1e-6), max(cy, 1e-6)
+
+    def band(sub, y0, _h):
+        y, x = np.ogrid[y0:y0 + sub.size[1], 0:W]
+        d2 = (((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2) / 2.0   # 0 centre, 1 corner
+        arr = np.asarray(sub, np.float32) * (1.0 - amt * d2)[..., None]
+        return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+    return _by_strips(img, band)
+
+
+def _grain(img, amt):
+    """Monochrome gaussian grain.
+
+    Seeded from the band's position, so the same edits always render the same
+    bytes — an unseeded rng would make every cache render a different picture.
+    """
+    def band(sub, y0, _h):
+        w, h = sub.size
+        noise = np.random.default_rng(9781 + y0).normal(0.0, 26.0 * amt, (h, w, 1))
+        arr = np.asarray(sub, np.float32) + noise.astype(np.float32)
+        return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+    # ponytail: grain is sized in output pixels, so a thumbnail shows coarser
+    # grain than the export. Scale by long edge if that ever matters.
+    return _by_strips(img, band)
+
+
+def _scale_about_centre(im, s):
+    W, H = im.size
+    return im.transform((W, H), Image.AFFINE,
+                        (s, 0, W / 2.0 * (1 - s), 0, s, H / 2.0 * (1 - s)),
+                        resample=Image.BILINEAR)
+
+
+def _lens_distort(img, k, steps=24):
+    """Radial distortion correction via a PIL mesh warp.
+
+    Source radius is scaled by (1 + k·r²), normalised so r=1 (the corners) maps
+    to itself — the frame stays full, no black wedges to crop away. The mesh is
+    coarse and PIL interpolates inside each quad, which is why this costs
+    milliseconds instead of a per-pixel remap in Python.
+    """
+    W, H = img.size
+    cx, cy = W / 2.0, H / 2.0
+    half = math.hypot(W, H) / 2.0
+    denom = 1.0 + k
+
+    pts = []
+    for j in range(steps + 1):
+        row = []
+        for i in range(steps + 1):
+            x, y = W * i / steps, H * j / steps
+            u, v = (x - cx) / half, (y - cy) / half
+            s = (1.0 + k * (u * u + v * v)) / denom
+            row.append((u * s * half + cx, v * s * half + cy))
+        pts.append(row)
+
+    mesh = []
+    for j in range(steps):
+        for i in range(steps):
+            box = (int(W * i / steps), int(H * j / steps),
+                   int(W * (i + 1) / steps), int(H * (j + 1) / steps))
+            nw, ne = pts[j][i], pts[j][i + 1]
+            sw, se = pts[j + 1][i], pts[j + 1][i + 1]
+            mesh.append((box, (nw[0], nw[1], sw[0], sw[1], se[0], se[1], ne[0], ne[1])))
+    return img.transform((W, H), Image.MESH, mesh, resample=Image.BILINEAR)
+
+
+def _lens_ca(img, amt):
+    """Lateral chromatic aberration: scale red and blue against green."""
+    e = 0.003 * amt
+    r, g, b = img.split()
+    return Image.merge("RGB", (_scale_about_centre(r, 1.0 + e), g,
+                               _scale_about_centre(b, 1.0 - e)))
+
+
+def _perspective(img, pv, ph):
+    """Keystone correction.
+
+    The output is the full frame and the *source* quad is a trapezoid inside the
+    image, so every output pixel samples real pixels — the converging edge gets
+    stretched back out instead of leaving empty corners behind.
+    """
+    W, H = img.size
+    tv, th = 0.25 * W * pv, 0.25 * H * ph
+    top, bot = max(0.0, tv), max(0.0, -tv)
+    lef, rig = max(0.0, th), max(0.0, -th)
+    dst = [(0, 0), (W, 0), (W, H), (0, H)]
+    src = [(top, lef), (W - top, rig), (W - bot, H - rig), (bot, H - lef)]
+    A, B = [], []
+    for (x, y), (u, v) in zip(dst, src):
+        A.append([x, y, 1, 0, 0, 0, -u * x, -u * y]); B.append(u)
+        A.append([0, 0, 0, x, y, 1, -v * x, -v * y]); B.append(v)
+    try:
+        co = np.linalg.solve(np.array(A, np.float64), np.array(B, np.float64))
+    except np.linalg.LinAlgError:
+        return img
+    return img.transform((W, H), Image.PERSPECTIVE, tuple(co), resample=Image.BICUBIC)
+
+
+def _box1d(a, r, axis):
+    """Running mean of width 2r+1 along `axis`, edges extended."""
+    n = a.shape[axis]
+    pad = [(r + 1, r) if i == axis else (0, 0) for i in range(a.ndim)]
+    c = np.cumsum(np.pad(a, pad, mode="edge"), axis=axis)
+    lo = np.take(c, np.arange(n), axis=axis)
+    hi = np.take(c, np.arange(2 * r + 1, 2 * r + 1 + n), axis=axis)
+    return (hi - lo) / float(2 * r + 1)
+
+
+def _smooth(a, r, passes=2):
+    """Cheap gaussian-ish blur: repeated box blur, separable, all in numpy.
+
+    The windows this runs on are a retouch region plus its rim, so integral-image
+    box passes are both simpler and faster than pulling in a real convolution.
+    """
+    for _ in range(passes):
+        a = _box1d(_box1d(a, r, 0), r, 1)
+    return a
+
+
+def _stroke_mask(size, pts, r):
+    """Union of discs of radius `r` along the path `pts`, as an "L" image.
+
+    One point is a spot, several are a brush stroke — the renderer never needs
+    to know which. PIL draws (and clips) this in C, which is why a stroke costs
+    the same as a dab.
+    """
+    m = Image.new("L", size, 0)
+    d = ImageDraw.Draw(m)
+    # consecutive duplicates make the joint geometry degenerate
+    path = [tuple(p) for i, p in enumerate(pts) if i == 0 or tuple(p) != tuple(pts[i - 1])]
+    if len(path) > 1:
+        d.line(path, fill=255, width=max(1, 2 * r), joint="curve")
+    for (x, y) in path:
+        d.ellipse((x - r, y - r, x + r, y + r), fill=255)
+    return m
+
+
+def _paint_heal(img, pts, r, dx, dy, mode):
+    """Heal (or clone) everything under a painted region, from one offset.
+
+    The whole region is sourced by a single translation rather than dab by dab:
+    independently chosen sources would each be plausible and together look like
+    a patchwork, because the texture wouldn't line up across the stroke.
+
+    Gradient-domain healing, the cheap stand-in for Poisson blending that phone
+    editors use, does the rest. The annulus *around* the region is clean on both
+    sides, so the source-minus-destination difference measured there is pure
+    lighting mismatch; smoothing it inward extrapolates the correction across
+    the region, which then inherits the destination's colour and shading. A
+    single mean offset would stamp a flat patch onto a gradient and show its
+    edge.
+
+    Everything is clipped to the frame, so brushing off the edge of the picture
+    simply paints the part that is on it. `img` is modified in place.
+    """
+    W, H = img.size
+    if not pts or (dx == 0 and dy == 0):
+        return
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    pad = int(r * 2.7) + 3          # room for the confidence ring and the feather
+    # the window has to be inside the frame for the region *and* for the source
+    # it is read from, so it is clipped against both
+    bx0 = int(max(0, min(xs) - pad, -dx))
+    by0 = int(max(0, min(ys) - pad, -dy))
+    bx1 = int(min(W, max(xs) + pad + 1, W - dx))
+    by1 = int(min(H, max(ys) + pad + 1, H - dy))
+    if bx1 - bx0 < 4 or by1 - by0 < 4:
+        return
+    box = (bx0, by0, bx1, by1)
+    size = (bx1 - bx0, by1 - by0)
+    local = [(x - bx0, y - by0) for (x, y) in pts]   # masks only cover the window
+
+    hard = _stroke_mask(size, local, r)
+    alpha = np.asarray(hard.filter(ImageFilter.GaussianBlur(max(1.0, r * 0.35))),
+                       np.float32)[..., None] / 255.0
+    if alpha.max() <= 0.0:
+        return
+
+    dst = np.asarray(img.crop(box), np.float32)
+    src = np.asarray(img.crop((bx0 + dx, by0 + dy, bx1 + dx, by1 + dy)), np.float32)
+    if mode != "clone":
+        inner = np.asarray(_stroke_mask(size, local, int(r * 1.5)), np.float32)
+        outer = np.asarray(_stroke_mask(size, local, int(r * 2.5)), np.float32)
+        conf = ((outer - inner) / 255.0)[..., None]
+        if conf.sum() > 0:
+            rb = max(2, int(r * 0.8))
+            src = src + _smooth((dst - src) * conf, rb) / np.maximum(_smooth(conf, rb), 1e-6)
+    merged = dst * (1.0 - alpha) + np.clip(src, 0.0, 255.0) * alpha
+    img.paste(Image.fromarray(merged.astype(np.uint8)), (bx0, by0))
+
+
+def _spot_geometry(s, W, H):
+    """Normalise one stored retouch entry to (points in px, radius, dx, dy, mode).
+
+    A brushed stroke stores its path and one source offset; a tapped spot stores
+    a single point, and older ones store an absolute source point instead of an
+    offset. They all render through the same painted-region path.
+    """
+    if not isinstance(s, dict):
+        return None
+    try:
+        r = max(2, int(round(float(s["r"]) * min(W, H))))
+        raw = s.get("pts") or [[s["x"], s["y"]]]
+        pts = [(float(p[0]) * W, float(p[1]) * H) for p in raw if len(p) >= 2]
+        if not pts:
+            return None
+        if "dx" in s or "dy" in s:
+            dx = int(round(float(s.get("dx", 0)) * W))
+            dy = int(round(float(s.get("dy", 0)) * H))
+        else:   # legacy spot: an absolute source point, relative to the first dab
+            dx = int(round(float(s["sx"]) * W)) - int(round(pts[0][0]))
+            dy = int(round(float(s["sy"]) * H)) - int(round(pts[0][1]))
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None
+    return pts, r, dx, dy, s.get("mode", "heal")
+
+
+def _apply_spots(img, spots):
+    """Apply the retouch list in order, each entry over the result of the last.
+
+    Coordinates are normalised against this (already cropped) frame and the
+    radius against its short edge, so the UI can paint on exactly the picture it
+    draws.
+    """
+    W, H = img.size
+    out = None
+    for s in spots or ():
+        geom = _spot_geometry(s, W, H)
+        if not geom:
+            continue
+        if out is None:
+            out = img.copy()          # only copy once we know we'll paint
+        _paint_heal(out, *geom)
+    return out if out is not None else img
+
+
+def _find_paint_offset(img, pts, r):
+    """Best single translation to source a painted region from, or None.
+
+    Candidates are scored on how well their rim matches the rim around the
+    region, with a penalty for busy source areas — pasting an edge or a texture
+    boundary over a blemish trades one artefact for another. Candidates whose
+    source would overlap the region itself are rejected outright: that is how a
+    long stroke along a power line avoids healing it with more of the line.
+    """
+    W, H = img.size
+    if not pts:
+        return None
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    pad = int(r * 2.7) + 3
+    x0, y0 = int(max(0, min(xs) - pad)), int(max(0, min(ys) - pad))
+    x1, y1 = int(min(W, max(xs) + pad + 1)), int(min(H, max(ys) + pad + 1))
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+    size = (x1 - x0, y1 - y0)
+    local = [(x - x0, y - y0) for (x, y) in pts]
+
+    step = max(1, r // 6)             # this is a similarity vote, not a render
+    region = np.asarray(_stroke_mask(size, local, r))[::step, ::step] > 127
+    inner = np.asarray(_stroke_mask(size, local, int(r * 1.5)))[::step, ::step] > 127
+    outer = np.asarray(_stroke_mask(size, local, int(r * 2.5)))[::step, ::step] > 127
+    rim = (outer & ~inner)
+    if not rim.any() or not region.any():
+        return None
+    weight = rim.astype(np.float32)[..., None]
+    total = float(weight.sum())
+    dst = np.asarray(img.crop((x0, y0, x1, y1)), np.float32)[::step, ::step]
+
+    # a long stroke needs a long escape route: every offset along its own axis
+    # overlaps it and gets rejected, so give the search one that clears it
+    span = max(max(xs) - min(xs), max(ys) - min(ys))
+    dists = [2.2 * r, 3.2 * r, 4.5 * r, 6.5 * r]
+    if span > 4 * r:
+        dists.append(0.6 * span + 2.2 * r)
+    best, best_score = None, None
+    for i in range(24):
+        ang = i * math.pi / 12.0
+        ca, sa = math.cos(ang), math.sin(ang)
+        for dist in dists:
+            dx, dy = int(round(ca * dist)), int(round(sa * dist))
+            if x0 + dx < 0 or y0 + dy < 0 or x1 + dx > W or y1 + dy > H:
+                continue
+            if _shifted_overlap(region, dx // step, dy // step):
+                continue
+            src = np.asarray(img.crop((x0 + dx, y0 + dy, x1 + dx, y1 + dy)),
+                             np.float32)[::step, ::step]
+            score = float((((src - dst) ** 2) * weight).sum() / total)
+            score += 0.4 * float(src[region].var())
+            if best_score is None or score < best_score:
+                best, best_score = (dx, dy), score
+    if best is None:
+        return None
+    return best[0] / float(W), best[1] / float(H)
+
+
+def _shifted_overlap(mask, dx, dy):
+    """Does `mask` overlap itself translated by (dx, dy)?"""
+    h, w = mask.shape
+    if abs(dx) >= w or abs(dy) >= h:
+        return False
+    a = mask[max(0, dy):h + min(0, dy), max(0, dx):w + min(0, dx)]
+    b = mask[max(0, -dy):h + min(0, -dy), max(0, -dx):w + min(0, -dx)]
+    return bool((a & b).any())
+
+
+def _apply_edits(img, edits):
+    """Apply the non-destructive edit stack to a PIL image; falsy = original.
+
+    Order matters and mirrors what the UI draws on:
+
+      orient (90° steps + flips, lossless)
+      lens (distortion, chromatic aberration, keystone) — on the full frame,
+        before anything crops it, so the corners are still there to correct
+      straighten (auto-cropped to the largest inscribed rect)
+      crop (normalized 0..1 of the rotated frame)
+      retouch spots (normalized to the cropped frame — what the user clicked on)
+      tone: exposure/highlights/shadows/whites/blacks, auto-levels, white
+        balance, brightness, contrast, vibrance, saturation
+      detail: clarity, noise reduction, sharpness
+      look: black & white, vignette, grain
+      border last, so its colour lands exactly as picked
+    """
+    edits = applied_edits(edits)
     if not edits:
         return img
     rot = int(edits.get("rot", 0)) % 360
@@ -297,7 +777,19 @@ def _apply_edits(img, edits):
         img = img.transpose(Image.FLIP_LEFT_RIGHT)
     if edits.get("flipV"):
         img = img.transpose(Image.FLIP_TOP_BOTTOM)
-    fine = float(edits.get("fine", 0) or 0)
+
+    # ---- lens corrections ----
+    distort = _f(edits, "distort")
+    if distort:
+        img = _lens_distort(img, distort)
+    ca = _f(edits, "ca")
+    if ca:
+        img = _lens_ca(img, ca)
+    pv, ph = _f(edits, "persV"), _f(edits, "persH")
+    if pv or ph:
+        img = _perspective(img, pv, ph)
+
+    fine = _f(edits, "fine")
     if fine:
         w, h = img.size
         img = img.rotate(-fine, resample=Image.BICUBIC, expand=True)  # positive = CW
@@ -315,6 +807,16 @@ def _apply_edits(img, edits):
         box = (int(l * w), int(t * h), int(r * w), int(b * h))
         if box[2] > box[0] and box[3] > box[1]:
             img = img.crop(box)
+
+    if edits.get("spots"):
+        img = _apply_spots(img, edits["spots"])
+
+    # ---- tone ----
+    exposure = _f(edits, "exposure")
+    hi, sh = _f(edits, "highlights"), _f(edits, "shadows")
+    wh, bl = _f(edits, "whites"), _f(edits, "blacks")
+    if exposure or hi or sh or wh or bl:
+        img = img.point(_tone_lut(exposure, hi, sh, wh, bl) * 3)
     if edits.get("auto"):
         # auto-levels: stretch the histogram, clipping 1% outliers per channel
         img = ImageOps.autocontrast(img, cutoff=1)
@@ -322,9 +824,8 @@ def _apply_edits(img, edits):
     # older single-axis control (kept so photos edited before the R/B split
     # still render the same) — it nudges both channels oppositely, as before;
     # wbR/wbB move independently on top of that.
-    temp = float(edits.get("temp", 0) or 0)
-    wb_r = float(edits.get("wbR", 0) or 0)
-    wb_b = float(edits.get("wbB", 0) or 0)
+    temp = _f(edits, "temp")
+    wb_r, wb_b = _f(edits, "wbR"), _f(edits, "wbB")
     if temp or wb_r or wb_b:
         r_gain = 1 + 0.3 * (temp + wb_r)
         b_gain = 1 + 0.3 * (-temp + wb_b)
@@ -336,12 +837,45 @@ def _apply_edits(img, edits):
                 b = b.point(lambda v: min(255, int(v * b_gain)))
             img = Image.merge("RGB", (r, g, b))
     for key, Enh in (("bright", ImageEnhance.Brightness),
-                     ("contrast", ImageEnhance.Contrast),
-                     ("saturation", ImageEnhance.Color),
-                     ("sharpness", ImageEnhance.Sharpness)):
+                     ("contrast", ImageEnhance.Contrast)):
         v = edits.get(key)
         if v is not None and float(v) != 1.0:
             img = Enh(img).enhance(float(v))
+    vib = _f(edits, "vibrance")
+    if vib:
+        img = _vibrance(img, vib)
+    sat = edits.get("saturation")
+    if sat is not None and float(sat) != 1.0:
+        img = ImageEnhance.Color(img).enhance(float(sat))
+
+    # ---- detail ----
+    clarity = _f(edits, "clarity")
+    if clarity:
+        radius = max(2.0, min(img.size) / 90.0)
+        if clarity > 0:
+            img = img.filter(ImageFilter.UnsharpMask(
+                radius=radius, percent=int(clarity * 110), threshold=3))
+        else:
+            img = Image.blend(img, img.filter(ImageFilter.GaussianBlur(radius)),
+                              min(0.85, -clarity * 0.85))
+    nr = _f(edits, "denoise")
+    if nr > 0:
+        # median keeps edges where a blur would smear them, and PIL runs it in C
+        img = Image.blend(img, img.filter(ImageFilter.MedianFilter(3)), min(1.0, nr))
+    shp = edits.get("sharpness")
+    if shp is not None and float(shp) != 1.0:
+        img = ImageEnhance.Sharpness(img).enhance(float(shp))
+
+    # ---- look ----
+    if edits.get("bw"):
+        img = ImageOps.grayscale(img).convert("RGB")
+    vig = _f(edits, "vignette")
+    if vig:
+        img = _vignette(img, vig)
+    grain = _f(edits, "grain")
+    if grain > 0:
+        img = _grain(img, grain)
+
     b = edits.get("border")
     if b and b.get("w"):
         # width is a fraction of the short edge, so previews and full-size
@@ -352,7 +886,22 @@ def _apply_edits(img, edits):
     return img
 
 
+def applied_edits(edits):
+    """The stack minus `off`, or None if nothing is left.
+
+    The UI parks switched-off adjustments under `off` so their values survive to
+    be switched back on. They change no pixels, so everything that asks "is this
+    edited" — cache keys, the export bake, save-copy — has to look past them, or
+    a photo with every adjustment switched off renders and exports as edited.
+    """
+    if not edits:
+        return None
+    live = {k: v for k, v in edits.items() if k != "off"}
+    return live or None
+
+
 def _edits_tag(edits):
+    edits = applied_edits(edits)
     if not edits:
         return ""
     return hashlib.md5(json.dumps(edits, sort_keys=True).encode("utf-8")).hexdigest()[:12]
@@ -363,7 +912,7 @@ def get_edits(path):
         row = conn.execute("SELECT edits FROM photos WHERE path=?", (path,)).fetchone()
     if row and row["edits"]:
         try:
-            return json.loads(row["edits"])
+            return applied_edits(json.loads(row["edits"]))
         except Exception:
             return None
     return None
@@ -386,12 +935,28 @@ def _save_cache_jpeg(img, out, **kw):
     try:
         img.save(tmp, "JPEG", **kw)
         os.replace(str(tmp), str(out))
+        _note_render()
     finally:
         if tmp.exists():
             try:
                 tmp.unlink()
             except OSError:
                 pass
+
+
+# Startup used to be the only thing that ever pruned. A long editing session
+# adds a render per slider release and, now, a preview-size decode per RAW, so
+# the cache is also checked every so often while the app is up.
+_renders_since_prune = 0
+PRUNE_EVERY = 150
+
+
+def _note_render():
+    global _renders_since_prune
+    _renders_since_prune += 1
+    if _renders_since_prune >= PRUNE_EVERY:
+        _renders_since_prune = 0
+        threading.Thread(target=prune_cache, daemon=True).start()
 
 
 def prune_cache(budget=CACHE_BUDGET):
@@ -429,6 +994,11 @@ def prune_cache(budget=CACHE_BUDGET):
     return freed
 
 
+# A full-res decode is hundreds of MB for a 45MP RAW and the grid fires dozens
+# of thumbnail requests at once; without a cap the thread pool decodes 40 in
+# parallel and the process balloons.
+_render_sem = threading.Semaphore(max(2, min(8, os.cpu_count() or 4)))
+
 _NO_EDITS = object()   # sentinel: "look up stored edits" vs an explicit (maybe {}) override
 
 # RAM cache of un-edited preview-size base images, so live editor renders skip
@@ -437,32 +1007,49 @@ _base_lock = threading.Lock()
 _base_cache = OrderedDict()   # path -> (mtime, PIL image at PREVIEW_SIZE)
 
 
-def _preview_base(path, mtime):
+def _preview_base(path, mtime, full=False):
+    """Un-edited image at preview size, RAM-cached (and disk-cached when `full`).
+
+    `full` demosaics a RAW properly instead of lifting its embedded preview.
+    That decode costs seconds, so the result is also written to the render cache
+    — the price is paid once per photo, not once per visit or once per session.
+    """
+    key = (path, full)
     with _base_lock:
-        v = _base_cache.get(path)
+        v = _base_cache.get(key)
         if v and v[0] == mtime:
-            _base_cache.move_to_end(path)
+            _base_cache.move_to_end(key)
             return v[1]
-    img = _load_pil(path)
-    img.thumbnail((PREVIEW_SIZE, PREVIEW_SIZE), Image.LANCZOS)
+    img = None
+    disk = _cache_file(path, mtime, "rawbase", "") if full else None
+    if disk is not None and disk.exists():
+        try:
+            img = Image.open(disk)
+            img.load()
+        except OSError:
+            img = None
+    if img is None:
+        # a full RAW decode is a few hundred MB; the semaphore keeps a burst of
+        # them (arrow-keying through a folder) from stacking up in memory
+        with _render_sem:
+            img = _load_raw_full(path) if full else _load_pil(path)
+            img.thumbnail((PREVIEW_SIZE, PREVIEW_SIZE), Image.LANCZOS)
+        if disk is not None:
+            _save_cache_jpeg(img, disk, quality=92)
     with _base_lock:
-        _base_cache[path] = (mtime, img)
+        _base_cache[key] = (mtime, img)
         while len(_base_cache) > 4:
             _base_cache.popitem(last=False)
     return img
 
 
-# A full-res decode is hundreds of MB for a 45MP RAW and the grid fires dozens
-# of thumbnail requests at once; without a cap the thread pool decodes 40 in
-# parallel and the process balloons.
-_render_sem = threading.Semaphore(max(2, min(8, os.cpu_count() or 4)))
-
-
-def get_rendered(path, long_edge, size_tag, edits=_NO_EDITS):
+def get_rendered(path, long_edge, size_tag, edits=_NO_EDITS, full=False):
     """Generate (or fetch from cache) a JPEG resized to `long_edge`. Returns Path.
 
     Pass `edits` explicitly (incl. {} for original) to render a live editor
-    preview; omit it to use the photo's stored edits.
+    preview; omit it to use the photo's stored edits. `full` renders a RAW off a
+    real demosaic — the same pixels the export starts from — instead of the
+    embedded camera preview, so the loupe shows what the export will produce.
     """
     try:
         st = os.stat(path)
@@ -472,17 +1059,23 @@ def get_rendered(path, long_edge, size_tag, edits=_NO_EDITS):
     if not live:
         edits = get_edits(path)
     tag = _edits_tag(edits)
+    if full:
+        size_tag = size_tag + "full"     # a different picture, so a different key
     out = _cache_file(path, st.st_mtime, size_tag, tag)
     if out.exists():
         return out
-    if live and size_tag == "preview":
-        # ponytail: live editor renders edit a RAM-cached 2400px base and skip
+    if full or (live and size_tag == "preview"):
+        # ponytail: these renders edit a cached preview-size base and skip
         # `optimize` — a heavy crop previews below full detail until the stored
-        # render replaces it. It gets its own cache name so that quick draft
-        # never gets served later as the committed render for the same edits.
-        draft = _cache_file(path, st.st_mtime, "draft", tag)
+        # render replaces it. Live drafts get their own cache name so a quick
+        # draft never gets served later as the committed render for the same
+        # edits. `full` always takes this path: re-demosaicing 40MP on every
+        # slider release would make RAW editing unusable, and the difference at
+        # preview size is scale-dependent filters, not colour.
+        draft = out if full else _cache_file(path, st.st_mtime, "draft", tag)
         if not draft.exists():
-            img = _apply_edits(_preview_base(path, st.st_mtime), edits)
+            img = _apply_edits(_preview_base(path, st.st_mtime, full), edits)
+            img.thumbnail((long_edge, long_edge), Image.LANCZOS)
             _save_cache_jpeg(img, draft, quality=86)
         return draft
     with _render_sem:
@@ -655,6 +1248,15 @@ class EditReq(BaseModel):
 
 class SaveCopyReq(BaseModel):
     path: str
+    source: Optional[str] = None   # render from this file instead (the RAW twin)
+
+
+class PaintReq(BaseModel):
+    path: str
+    pts: List[List[float]]         # brush path, normalized to the displayed frame
+    r: float
+    edits: Optional[dict] = None
+    full: bool = False             # search on the RAW decode the loupe is showing
 
 
 class SplitReq(BaseModel):
@@ -672,6 +1274,11 @@ class ExportReq(BaseModel):
     keep_structure: bool = False
     compress: bool = False      # re-encode JPEGs to shrink them
     quality: int = 85           # JPEG quality when compress is on
+    # What to produce for a RAW file. Independent, so a shoot can go out as the
+    # negative *and* a finished JPEG in one pass.
+    raw_jpeg: bool = False      # render a JPEG from a full RAW decode, edits baked
+    raw_copy: bool = True       # copy/move the RAW file itself
+    raw_sidecar: bool = False   # write an .xmp beside the copied RAW
 
 
 # ----------------------------------------------------------------------------
@@ -833,17 +1440,19 @@ def api_thumb(path: str = Query(...)):
 
 
 @app.get("/api/preview")
-def api_preview(path: str = Query(...), edits: Optional[str] = Query(None)):
+def api_preview(path: str = Query(...), edits: Optional[str] = Query(None),
+                full: int = Query(0)):
     # `edits` (JSON) overrides stored edits for live editor previews; absent =
-    # use the photo's stored edits.
+    # use the photo's stored edits. `full=1` decodes a RAW properly instead of
+    # using its embedded preview, so the loupe matches the RAW export.
     if edits is not None:
         try:
             e = json.loads(edits)
         except Exception:
             e = {}
-        f = get_rendered(path, PREVIEW_SIZE, "preview", edits=e)
+        f = get_rendered(path, PREVIEW_SIZE, "preview", edits=e, full=bool(full))
     else:
-        f = get_rendered(path, PREVIEW_SIZE, "preview")
+        f = get_rendered(path, PREVIEW_SIZE, "preview", full=bool(full))
     return FileResponse(f, media_type="image/jpeg")
 
 
@@ -862,7 +1471,7 @@ def _fmt_shutter(v):
 
 
 @app.get("/api/meta")
-def api_meta(path: str = Query(...)):
+def api_meta(path: str = Query(...), full: int = Query(0)):
     """Best-effort shooting info (EXIF) for the loupe info panel.
 
     Anything unreadable is simply null — RAW support depends on how much of the
@@ -875,9 +1484,21 @@ def api_meta(path: str = Query(...)):
     out = {"size": st.st_size, "width": None, "height": None, "camera": None,
            "lens": None, "shutter": None, "aperture": None, "iso": None,
            "focal": None}
+    if full and HAVE_RAWPY and os.path.splitext(path)[1].lower() in RAW_EXTS:
+        # the loupe is showing the demosaiced negative, which is not the size of
+        # the camera JPEG beside it. libraw reads this out of the header, so it
+        # costs nothing like a decode.
+        try:
+            with rawpy.imread(path) as raw:
+                out["width"], out["height"] = raw.sizes.width, raw.sizes.height
+                if raw.sizes.flip in (5, 6):     # 90° either way
+                    out["width"], out["height"] = out["height"], out["width"]
+        except Exception:
+            pass
     try:
         with Image.open(path) as img:
-            out["width"], out["height"] = img.size
+            if not out["width"]:
+                out["width"], out["height"] = img.size
             exif = img.getexif()
             make = str(exif.get(271, "")).strip()
             model = str(exif.get(272, "")).strip()
@@ -915,6 +1536,31 @@ def api_edit(req: EditReq):
     return {"ok": True, "path": req.path, "edits": req.edits}
 
 
+@app.post("/api/plan-paint")
+def api_plan_paint(req: PaintReq):
+    """Pick where a painted retouch region should source its pixels from.
+
+    The client stores the answer in the stroke rather than letting the renderer
+    search again: the search depends on resolution, and a preview that healed
+    from one patch while the export healed from another would be a bug you only
+    notice after the file is written.
+    """
+    try:
+        st = os.stat(req.path)
+    except OSError:
+        raise HTTPException(status_code=404, detail="file not found")
+    edits = dict(req.edits or {})
+    edits.pop("border", None)      # the client hides the border while retouching
+    img = _apply_edits(_preview_base(req.path, st.st_mtime, req.full), edits)
+    W, H = img.size
+    pts = [(float(p[0]) * W, float(p[1]) * H) for p in req.pts if len(p) >= 2]
+    r = max(2, int(round(float(req.r) * min(W, H))))
+    found = _find_paint_offset(img, pts, r)
+    if not found:
+        raise HTTPException(status_code=400, detail="no usable source area nearby")
+    return {"dx": found[0], "dy": found[1]}
+
+
 @app.post("/api/save-copy")
 def api_save_copy(req: SaveCopyReq):
     """Bake a photo's edits into a new JPEG next to the original.
@@ -931,11 +1577,25 @@ def api_save_copy(req: SaveCopyReq):
     if not os.path.isfile(req.path):
         raise HTTPException(status_code=404, detail="file not found")
     try:
-        edits = json.loads(row["edits"]) if row["edits"] else None
+        edits = applied_edits(json.loads(row["edits"])) if row["edits"] else None
     except (TypeError, ValueError):
         edits = None
     if not edits:
         raise HTTPException(status_code=400, detail="photo has no edits")
+
+    # In RAW view the editor renders the negative, so a copy saved from that
+    # view has to come off the negative too — baking the JPEG instead would hand
+    # back a file that doesn't match what was on screen. Only a sibling of the
+    # photo qualifies, so `source` can't point anywhere it likes.
+    source = req.path
+    if req.source and req.source != req.path:
+        same_dir = os.path.dirname(req.source) == os.path.dirname(req.path)
+        same_base = (os.path.splitext(os.path.basename(req.source))[0].lower() ==
+                     os.path.splitext(os.path.basename(req.path))[0].lower())
+        if not (same_dir and same_base and os.path.isfile(req.source)):
+            raise HTTPException(status_code=400, detail="source is not a sibling of path")
+        source = req.source
+    raw_full = os.path.splitext(source)[1].lower() in RAW_EXTS
 
     d = os.path.dirname(req.path)
     base = os.path.splitext(os.path.basename(req.path))[0]
@@ -944,7 +1604,7 @@ def api_save_copy(req: SaveCopyReq):
     while os.path.exists(target):
         target = os.path.join(d, "{}_edited_{}.jpg".format(base, n))
         n += 1
-    _bake_to_jpeg(req.path, target, edits, 92)
+    _bake_to_jpeg(source, target, edits, 92, raw_full=raw_full)
 
     target = os.path.abspath(target)
     st = os.stat(target)
@@ -1069,6 +1729,22 @@ def api_export(req: ExportReq):
     total = len(rows)
     quality = max(1, min(100, int(req.quality)))
 
+    # A RAW usually carries no edits of its own — they live on the JPEG the UI
+    # showed while you were editing. Rendering "the JPEG from the RAW" has to
+    # use that same stack, so look it up by base name within the folder.
+    def _base_key(path):
+        return (os.path.dirname(path), os.path.splitext(os.path.basename(path))[0].lower())
+
+    group_edits = {}
+    with db() as conn:
+        for gr in conn.execute("SELECT path, edits FROM photos WHERE folder=?", (folder,)):
+            if gr["edits"]:
+                group_edits.setdefault(_base_key(gr["path"]), gr["edits"])
+    # a RAW that has a same-named sibling in this export needs a distinct name,
+    # or the two renders would fight over <base>.jpg
+    raw_siblings = set(_base_key(r["path"]) for r in rows
+                       if os.path.splitext(r["path"])[1].lower() not in RAW_EXTS)
+
     def generate():
         done = 0
         errors = []
@@ -1089,18 +1765,15 @@ def api_export(req: ExportReq):
                 continue
 
             try:
-                edits = json.loads(r["edits"]) if r["edits"] else None
+                edits = applied_edits(json.loads(r["edits"])) if r["edits"] else None
             except (TypeError, ValueError):
                 edits = None
 
             src_ext = os.path.splitext(src)[1].lower()
+            is_raw = src_ext in RAW_EXTS
             is_jpeg = src_ext in {".jpg", ".jpeg"}
             do_compress = req.compress and is_jpeg
-            bake = bool(edits)
-            keep_raw = bake and req.action == "move" and src_ext in RAW_EXTS
-            name = os.path.basename(src)
-            if bake and not is_jpeg:
-                name = os.path.splitext(name)[0] + ".jpg"
+            bake = bool(edits) and not is_raw
 
             tdir = dest
             if req.keep_structure:
@@ -1110,37 +1783,84 @@ def api_export(req: ExportReq):
                 if not sub.startswith(".."):
                     tdir = os.path.join(dest, sub)
             os.makedirs(tdir, exist_ok=True)
-            target = os.path.join(tdir, name)
-            base_t, ext_t = os.path.splitext(target)
-            n = 1
-            while os.path.exists(target):   # never silently overwrite
-                target = "{}_{}{}".format(base_t, n, ext_t)
-                n += 1
 
+            def free_target(name):
+                """`name` inside tdir, suffixed until it doesn't overwrite anything."""
+                t = os.path.join(tdir, name)
+                stem, ext = os.path.splitext(t)
+                k = 1
+                while os.path.exists(t):
+                    t = "{}_{}{}".format(stem, k, ext)
+                    k += 1
+                return t
+
+            stem = os.path.splitext(os.path.basename(src))[0]
+            target = None
             try:
-                if bake:
-                    _bake_to_jpeg(src, target, edits, quality if do_compress else 92)
-                    if keep_raw:
-                        errors.append("kept RAW (a move would destroy it): " + src)
+                if is_raw:
+                    # A RAW can be exported as a finished JPEG rendered off the
+                    # negative, as the negative itself, or as both — the three
+                    # switches are independent. `raw_jpeg` off but the RAW
+                    # carrying its own edits still renders, which is what this
+                    # did before the switches existed.
+                    grp = group_edits.get(_base_key(src))
+                    if grp:
+                        try:
+                            grp = applied_edits(json.loads(grp))
+                        except (TypeError, ValueError):
+                            grp = None
+                    want_jpeg = req.raw_jpeg or bool(edits)
+                    want_copy = req.raw_copy or not want_jpeg   # never produce nothing
+                    if want_jpeg:
+                        suffix = "_raw" if _base_key(src) in raw_siblings else ""
+                        target = free_target(stem + suffix + ".jpg")
+                        _bake_to_jpeg(src, target, edits or grp,
+                                      quality if req.compress else 92, raw_full=True)
+                        files.append({"name": os.path.basename(target),
+                                      "dest": os.path.abspath(target), "compressed": True})
+                    if want_copy:
+                        raw_target = free_target(os.path.basename(src))
+                        if req.action == "move":
+                            shutil.move(src, raw_target)
+                            moved.append((src, os.path.abspath(raw_target)))
+                        else:
+                            shutil.copy2(src, raw_target)
+                        if req.raw_sidecar:
+                            _write_xmp_sidecar(raw_target, edits or grp,
+                                               r["rating"], r["flag"])
+                        files.append({"name": os.path.basename(raw_target),
+                                      "dest": os.path.abspath(raw_target),
+                                      "compressed": False})
+                        target = target or raw_target
                     elif req.action == "move":
-                        os.remove(src)
-                        moved.append((src, os.path.abspath(target)))
-                        baked.add(os.path.abspath(target))
-                elif do_compress:
-                    _compress_jpeg(src, target, quality)
-                    if req.action == "move":
-                        os.remove(src)
-                        moved.append((src, os.path.abspath(target)))
-                elif req.action == "move":
-                    shutil.move(src, target)
-                    moved.append((src, os.path.abspath(target)))
+                        errors.append("kept RAW (a move would destroy it): " + src)
+                    done += 1
                 else:
-                    shutil.copy2(src, target)
+                    name = os.path.basename(src)
+                    if bake and not is_jpeg:
+                        name = stem + ".jpg"
+                    target = free_target(name)
+                    if bake:
+                        _bake_to_jpeg(src, target, edits, quality if do_compress else 92)
+                        if req.action == "move":
+                            os.remove(src)
+                            moved.append((src, os.path.abspath(target)))
+                            baked.add(os.path.abspath(target))
+                    elif do_compress:
+                        _compress_jpeg(src, target, quality)
+                        if req.action == "move":
+                            os.remove(src)
+                            moved.append((src, os.path.abspath(target)))
+                    elif req.action == "move":
+                        shutil.move(src, target)
+                        moved.append((src, os.path.abspath(target)))
+                    else:
+                        shutil.copy2(src, target)
 
-                files.append({"name": os.path.basename(target),
-                               "dest": os.path.abspath(target),
-                               "compressed": do_compress or bake})
-                done += 1
+                    files.append({"name": os.path.basename(target),
+                                  "dest": os.path.abspath(target),
+                                  "compressed": do_compress or bake})
+                    done += 1
             except Exception as e:  # noqa
                 errors.append("{}: {}".format(src, e))
 
@@ -1215,10 +1935,35 @@ def api_delete_rejected(req: DeleteReq):
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
+def _free_port(host, port, tries=20):
+    """`port` if it is free, else the next one that is.
+
+    Starting a second copy — or having anything else on 8000 — used to be a
+    stack trace and no app. There is a race between testing and binding, but
+    for a tool that opens its own browser tab the printed URL is the answer.
+    """
+    for p in range(port, port + tries):
+        s = socket.socket()
+        try:
+            s.bind((host, p))
+            return p
+        except OSError:
+            continue
+        finally:
+            s.close()
+    return port
+
+
 def main():
     import uvicorn
     host = "127.0.0.1"
     port = 8000
+    if "--port" in sys.argv:
+        try:
+            port = int(sys.argv[sys.argv.index("--port") + 1])
+        except (IndexError, ValueError):
+            sys.exit("--port needs a number, e.g. --port 8080")
+    port = _free_port(host, port)
     url = "http://{}:{}".format(host, port)
     threading.Thread(target=prune_cache, daemon=True).start()
     if "--no-browser" not in sys.argv:

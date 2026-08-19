@@ -75,104 +75,21 @@
     <div id="viewerMain">
       <div id="panes"></div>
       <aside id="editBar" class="editsidebar hidden">
-        <datalist id="ticksMid"></datalist>
-        <datalist id="ticksSat"></datalist>
-        <datalist id="ticksSharp"></datalist>
         <datalist id="ticksBorder"></datalist>
         <datalist id="ticksFine"></datalist>
-        <datalist id="ticksTemp"></datalist>
+        <datalist id="ticksSpot"></datalist>
 
-        <section class="ed-section" data-sec="hist">
-          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Histogram</button>
-          <div class="ed-sec-body">
-            <div id="histPanel" class="histpanel hidden">
-              <canvas id="histCanvas" width="256" height="88"></canvas>
-              <div class="histlegend">
-                <span style="color:#ff5050">R</span> <span style="color:#50ff78">G</span>
-                <span style="color:#5a8cff">B</span> <span class="histghost">— before</span>
-              </div>
-              <div id="histChanges" class="histchanges"></div>
-            </div>
-          </div>
-        </section>
-
-        <section class="ed-section" data-sec="info">
-          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Info</button>
-          <div class="ed-sec-body">
-            <div id="metaPanel" class="metapanel hidden"></div>
-          </div>
-        </section>
-
-        <section class="ed-section" data-sec="croprotate">
-          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Crop &amp; Rotate</button>
+        <section class="ed-section" data-sec="history">
+          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> History</button>
           <div class="ed-sec-body">
             <div class="ed-btnrow">
-              <button data-act="rotL" title="Rotate left">⟲</button>
-              <button data-act="rotR" title="Rotate right">⟳</button>
-              <button data-act="flipH" title="Flip horizontal">⇆</button>
-              <button data-act="flipV" title="Flip vertical">⇅</button>
+              <button data-act="undo" title="Undo (Ctrl+Z)">↶ Undo</button>
+              <button data-act="redo" title="Redo (Ctrl+Y)">↷ Redo</button>
+              <button data-act="reset" title="Revert to original">Reset</button>
             </div>
             <div class="ed-btnrow">
-              <button data-act="crop" id="cropBtn" title="Crop (C) — drag a box on the image">⛶ Crop</button>
-              <button data-act="grid" id="gridBtn" title="Alignment grid (G) — helps straighten and compose">▦ Grid</button>
-            </div>
-            <div class="ed-row">
-              <div class="ed-head"><span class="ed-label">∠ Straighten</span>
-                <input type="number" class="num" id="fineRNum" min="-45" max="45" step="0.1" value="0" /><span class="unit">°</span></div>
-              <input type="range" id="fineR" min="-45" max="45" step="0.1" value="0" list="ticksFine"
-                     title="+ = clockwise, auto-crops the frame — double-click to reset" />
-            </div>
-          </div>
-        </section>
-
-        <section class="ed-section" data-sec="basic">
-          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Basic</button>
-          <div class="ed-sec-body">
-            <div class="ed-btnrow">
-              <button data-act="auto" id="autoBtn" title="Auto levels — histogram stretch, 1% clip">✨ Auto</button>
-              <button data-act="hist" id="histBtn" title="Histogram + change list (H) — original vs. edited">📊 Histogram</button>
-            </div>
-            <div class="ed-row">
-              <div class="ed-head"><span class="ed-label">🔴 WB Red</span>
-                <input type="number" class="num" data-num="wbR" min="-1" max="1" step="0.05" value="0.00" /></div>
-              <input type="range" data-edit="wbR" min="-1" max="1" step="0.02" value="0" list="ticksTemp" title="double-click to reset" />
-            </div>
-            <div class="ed-row">
-              <div class="ed-head"><span class="ed-label">🔵 WB Blue</span>
-                <input type="number" class="num" data-num="wbB" min="-1" max="1" step="0.05" value="0.00" /></div>
-              <input type="range" data-edit="wbB" min="-1" max="1" step="0.02" value="0" list="ticksTemp" title="double-click to reset" />
-            </div>
-            <div class="ed-row">
-              <div class="ed-head"><span class="ed-label">☀ Brightness</span>
-                <input type="number" class="num" data-num="bright" min="0.2" max="2" step="0.05" value="1.00" /></div>
-              <input type="range" data-edit="bright" min="0.2" max="2" step="0.02" value="1" list="ticksMid" title="double-click to reset" />
-            </div>
-            <div class="ed-row">
-              <div class="ed-head"><span class="ed-label">◐ Contrast</span>
-                <input type="number" class="num" data-num="contrast" min="0.2" max="2" step="0.05" value="1.00" /></div>
-              <input type="range" data-edit="contrast" min="0.2" max="2" step="0.02" value="1" list="ticksMid" title="double-click to reset" />
-            </div>
-            <div class="ed-row">
-              <div class="ed-head"><span class="ed-label">🎨 Saturation</span>
-                <input type="number" class="num" data-num="saturation" min="0" max="2" step="0.05" value="1.00" /></div>
-              <input type="range" data-edit="saturation" min="0" max="2" step="0.02" value="1" list="ticksSat" title="double-click to reset" />
-            </div>
-            <div class="ed-row">
-              <div class="ed-head"><span class="ed-label">🔪 Sharpness</span>
-                <input type="number" class="num" data-num="sharpness" min="0" max="3" step="0.05" value="1.00" /></div>
-              <input type="range" data-edit="sharpness" min="0" max="3" step="0.05" value="1" list="ticksSharp" title="double-click to reset" />
-            </div>
-          </div>
-        </section>
-
-        <section class="ed-section" data-sec="effects">
-          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Effects</button>
-          <div class="ed-sec-body">
-            <div class="ed-row">
-              <div class="ed-head"><span class="ed-label">▢ Border</span>
-                <input type="number" class="num" id="borderWNum" min="0" max="15" step="0.5" value="0" /><span class="unit">%</span>
-                <input type="color" id="borderC" value="#ffffff" title="Border color" /></div>
-              <input type="range" id="borderW" min="0" max="0.15" step="0.005" value="0" list="ticksBorder" title="double-click to remove" />
+              <button data-act="orig" id="origBtn" title="Toggle original / edited (O)">👁 Original</button>
+              <button data-act="save" title="Save edited copy as a new JPEG next to the original">💾 Save copy</button>
             </div>
           </div>
         </section>
@@ -191,17 +108,144 @@
           </div>
         </section>
 
-        <section class="ed-section" data-sec="history">
-          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> History</button>
+        <section class="ed-section" data-sec="hist">
+          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Histogram</button>
+          <div class="ed-sec-body">
+            <div id="histPanel" class="histpanel hidden">
+              <canvas id="histCanvas" width="256" height="88"></canvas>
+              <div class="histlegend">
+                <span style="color:#ff5050">R</span> <span style="color:#50ff78">G</span>
+                <span style="color:#5a8cff">B</span> <span class="histghost">— before</span>
+              </div>
+              <div id="histChanges" class="histchanges"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="ed-section" data-sec="info">
+          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Info</button>
+          <div class="ed-sec-body">
+            <div class="ed-btnrow hidden" id="srcRow"
+                 title="Which file the loupe renders. The camera JPEG is instant; the RAW is what an export rendered from the negative will look like.">
+              <button data-act="srcJpeg" id="srcJpegBtn">📄 JPEG</button>
+              <button data-act="srcRaw" id="srcRawBtn">🎞 RAW</button>
+            </div>
+            <div id="metaPanel" class="metapanel hidden"></div>
+          </div>
+        </section>
+
+        <section class="ed-section" data-sec="croprotate">
+          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Crop &amp; Rotate</button>
           <div class="ed-sec-body">
             <div class="ed-btnrow">
-              <button data-act="undo" title="Undo (Ctrl+Z)">↶ Undo</button>
-              <button data-act="redo" title="Redo (Ctrl+Y)">↷ Redo</button>
-              <button data-act="reset" title="Revert to original">Reset</button>
+              <button data-act="rotL" title="Rotate left">⟲</button>
+              <button data-act="rotR" title="Rotate right">⟳</button>
+              <button data-act="flipH" title="Flip horizontal">⇆</button>
+              <button data-act="flipV" title="Flip vertical">⇅</button>
             </div>
             <div class="ed-btnrow">
-              <button data-act="orig" id="origBtn" title="Toggle original / edited (O)">👁 Original</button>
-              <button data-act="save" title="Save edited copy as a new JPEG next to the original">💾 Save copy</button>
+              <button data-act="crop" id="cropBtn" title="Crop (C) — drag a box on the image">⛶ Crop</button>
+              <select id="cropAspect" title="Constrain the crop box to an aspect ratio">
+                <option value="">Free</option>
+                <option value="orig">Original</option>
+                <option value="1">1:1</option>
+                <option value="1.5">3:2</option>
+                <option value="0.6667">2:3</option>
+                <option value="1.3333">4:3</option>
+                <option value="0.75">3:4</option>
+                <option value="0.8">4:5</option>
+                <option value="1.25">5:4</option>
+                <option value="1.7778">16:9</option>
+                <option value="0.5625">9:16</option>
+              </select>
+            </div>
+            <div class="ed-btnrow">
+              <button data-act="grid" id="gridBtn" title="Alignment grid (G) — helps straighten and compose">▦ Grid</button>
+              <button data-act="hist" id="histBtn" title="Histogram + change list (H) — original vs. edited">📊 Histogram</button>
+            </div>
+            <div class="ed-row">
+              <div class="ed-head"><span class="ed-label">∠ Straighten</span>
+                <input type="number" class="num" id="fineRNum" min="-45" max="45" step="0.1" value="0" /><span class="unit">°</span></div>
+              <input type="range" id="fineR" min="-45" max="45" step="0.1" value="0" list="ticksFine"
+                     title="+ = clockwise, auto-crops the frame — double-click to reset" />
+            </div>
+          </div>
+        </section>
+
+        <section class="ed-section" data-sec="lens">
+          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Lens</button>
+          <div class="ed-sec-body">
+            <div data-sliders="lens"></div>
+            <div class="ed-btnrow">
+              <button data-act="lensReset" title="Clear every lens correction">Reset lens</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="ed-section" data-sec="light">
+          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Light</button>
+          <div class="ed-sec-body">
+            <div class="ed-btnrow">
+              <button data-act="auto" id="autoBtn" title="Auto levels — histogram stretch, 1% clip">✨ Auto</button>
+            </div>
+            <div data-sliders="light"></div>
+          </div>
+        </section>
+
+        <section class="ed-section" data-sec="color">
+          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Color</button>
+          <div class="ed-sec-body">
+            <div class="ed-btnrow">
+              <button data-act="bw" id="bwBtn" title="Convert to black &amp; white">◑ B&amp;W</button>
+            </div>
+            <div data-sliders="color"></div>
+          </div>
+        </section>
+
+        <section class="ed-section" data-sec="detail">
+          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Detail</button>
+          <div class="ed-sec-body">
+            <div data-sliders="detail"></div>
+          </div>
+        </section>
+
+        <section class="ed-section" data-sec="retouch">
+          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Retouch</button>
+          <div class="ed-sec-body">
+            <div class="ed-btnrow">
+              <button data-act="retouch" id="retouchBtn" title="Retouch (P) — brush over what you want gone">🩹 Retouch</button>
+            </div>
+            <div class="ed-btnrow">
+              <select id="spotTool" title="Brush paints over an area as you drag; Spot fixes one blemish per click and lets you drag out the source yourself">
+                <option value="brush">Brush</option>
+                <option value="spot">Spot</option>
+              </select>
+              <select id="spotModeSel" title="Heal blends what it paints into its surroundings; Clone copies pixels as they are">
+                <option value="heal">Heal</option>
+                <option value="clone">Clone</option>
+              </select>
+            </div>
+            <div class="ed-row">
+              <div class="ed-head"><span class="ed-label">◯ Brush size</span>
+                <input type="number" class="num" id="spotSizeNum" min="0.5" max="15" step="0.5" value="3" /><span class="unit">%</span></div>
+              <input type="range" id="spotSize" min="0.005" max="0.15" step="0.005" value="0.03" list="ticksSpot" />
+            </div>
+            <div class="ed-btnrow">
+              <button data-act="spotClear" title="Remove every retouch spot on this photo">🗑 Clear spots</button>
+            </div>
+            <div class="ed-hint">Brush over what you want gone · click a painted area to remove it</div>
+          </div>
+        </section>
+
+        <section class="ed-section" data-sec="effects">
+          <button type="button" class="ed-sec-head"><span class="chevron">▾</span> Effects</button>
+          <div class="ed-sec-body">
+            <div data-sliders="effects"></div>
+            <div class="ed-row">
+              <div class="ed-head"><span class="ed-label">▢ Border</span>
+                <input type="number" class="num" id="borderWNum" min="0" max="15" step="0.5" value="0" /><span class="unit">%</span>
+                <input type="color" id="borderC" value="#ffffff" title="Border color" /></div>
+              <input type="range" id="borderW" min="0" max="0.15" step="0.005" value="0" list="ticksBorder" title="double-click to remove" />
             </div>
           </div>
         </section>
@@ -264,18 +308,49 @@
           </ul>
           <h3>Edit (loupe sidebar)</h3>
           <ul>
-            <li>sections: Histogram, Info, Crop &amp; Rotate, Basic, Effects,
-              Presets, History — click a header to collapse it</li>
+            <li>sections: History, Presets, Histogram, Info, Crop &amp; Rotate,
+              Lens, Light, Color, Detail, Retouch, Effects — click a header to
+              collapse it</li>
             <li><kbd>Tab</kbd> hides/shows the whole sidebar (or click the ◂ tab)</li>
-            <li><kbd>C</kbd> crop · <kbd>O</kbd> original ⇄ edited · <kbd>I</kbd> EXIF · <kbd>G</kbd> grid · <kbd>H</kbd> histogram</li>
+            <li><kbd>C</kbd> crop · <kbd>P</kbd> retouch · <kbd>O</kbd> original ⇄ edited ·
+              <kbd>I</kbd> EXIF · <kbd>G</kbd> grid · <kbd>H</kbd> histogram</li>
+            <li>crop takes an aspect ratio (1:1, 3:2, 16:9, original…) that
+              constrains the drag</li>
             <li>alignment grid shows by default, forces on while straightening</li>
+            <li>Lens: barrel/pincushion distortion, chromatic aberration and
+              keystone — the frame stays full, no black corners to crop off</li>
+            <li>Light: exposure in stops, highlights, shadows, whites, blacks</li>
+            <li>Color: WB red/blue, vibrance, saturation, B&amp;W ·
+              Detail: clarity, sharpness, noise reduction ·
+              Effects: vignette, grain, border</li>
+            <li>Retouch (<kbd>P</kbd>): the ring under the cursor is the brush.
+              <b>Brush</b> paints over whatever you drag across; <b>Spot</b>
+              fixes one blemish per click and lets you drag out the source. The
+              source area is found for you either way. Heal takes the target's
+              colour and shading, Clone copies pixels as they are. Click a
+              painted region to remove it, brush past the edge of the frame
+              freely, and pan with the middle button while retouching</li>
+            <li>click any line in the histogram's change list to switch that one
+              adjustment off, click again to bring it back unchanged</li>
             <li>histogram overlays the original's tone curve in white and lists
               every active edit — how auto-levels (or anything else) actually
               changed the photo</li>
+            <li>a RAW+JPEG pair edits as one photo; the stack is mirrored onto
+              both files, and Export can write the JPEG, a JPEG rendered from
+              the RAW, the RAW itself and an .xmp sidecar in any combination</li>
+            <li>Info offers a <b>JPEG / RAW</b> switch for a photo that has a
+              negative. In RAW view everything works off the negative: every
+              adjustment, <kbd>O</kbd>, navigation, Save copy, and the size and
+              file rows. Ticking &ldquo;JPEG rendered from the RAW&rdquo; in
+              Export flips it to RAW so what you see is what gets written
+              (first load takes a few seconds, then it is cached; compare stays
+              on the fast previews)</li>
             <li>white balance: independent Red/Blue channel sliders — with
               Auto on, the histogram also estimates the Fuji WB shift (R/B)
               needed to match what Auto proposed</li>
             <li>every slider has tick marks and a type-in numeric field</li>
+            <li>sliders with a CSS equivalent preview as you drag; the rest
+              (highlights, lens, vignette…) render a server draft on each pause</li>
             <li>double-click a slider to reset it</li>
             <li><kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd> undo / redo (per photo)</li>
             <li><kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>Ctrl</kbd>+<kbd>V</kbd> copy / paste this photo's edits</li>
@@ -326,6 +401,12 @@
             <option value="70">70</option>
             <option value="60">60 (small)</option>
           </select></label>
+      </div>
+      <div id="exRawBox" class="rawbox hidden">
+        <div class="rawbox-title">RAW files &mdash; pick any combination</div>
+        <label class="chk"><input id="exRawJpeg" type="checkbox" /> JPEG rendered from the RAW (full decode, edits baked in)</label>
+        <label class="chk"><input id="exRawCopy" type="checkbox" checked /> the RAW file itself</label>
+        <label class="chk"><input id="exRawSidecar" type="checkbox" /> an .xmp sidecar beside it, holding the edits and the rating</label>
       </div>
       <div id="exStatus" class="status"></div>
       <div id="exProgress" class="ex-progress hidden">

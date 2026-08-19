@@ -21,10 +21,19 @@ const S = {
   groupRaw: true,      // combine same-named RAW + JPEG into one item
   editor: null,        // null | {path, showOrig} — active loupe editor
   cropMode: false,     // drawing a crop box
+  spotMode: false,     // placing retouch spots
   showMeta: true,      // EXIF info panel visible in loupe (default on)
   showGrid: true,      // alignment grid overlay in edit mode (default on)
   showHist: true,      // RGB histogram panel visible in loupe (default on)
+  previewSrc: "jpeg",  // for a RAW+JPEG pair: which file the loupe renders
 };
+
+// Remembered across sessions: whether the loupe shows the camera JPEG (instant,
+// the camera's own colour) or the negative decoded the way an export would.
+(function initPreviewSrc() {
+  const saved = localStorage.getItem("previewSrc");
+  if (saved === "jpeg" || saved === "raw") S.previewSrc = saved;
+})();
 
 const $ = (id) => document.getElementById(id);
 
@@ -60,12 +69,57 @@ function verSuffix(path) {
   return x && x._ev ? "&v=" + x._ev : "";
 }
 const thumbUrl = (p) => "/api/thumb?path=" + encodeURIComponent(p) + verSuffix(p);
+// The RAW file behind a photo, if it has one — either its own path or the
+// negative sitting beside the JPEG it is grouped with.
+function rawMemberPath(p) {
+  if (!p) return null;
+  const paths = (p.members && p.members.length) ? p.members : [p.path];
+  return paths.find((tp) => {
+    const m = S.byPath.get(tp);
+    return m && RAW_EXTS.has(m.ext);
+  }) || null;
+}
+
+// Which file the loupe should actually render, or null for "the photo itself".
+// Previewing the camera JPEG shows the camera's film simulation and tone curve;
+// an export rendered from the negative goes through libraw and looks different,
+// so the two are a deliberate choice rather than an accident.
+function rawRenderPath(p) {
+  if (S.previewSrc !== "raw") return null;
+  if (S.viewer && S.viewer.mode !== "loupe") return null;
+  return rawMemberPath(p);
+}
+
+function setPreviewSrc(which) {
+  if (S.previewSrc === which) return;
+  S.previewSrc = which;
+  localStorage.setItem("previewSrc", which);
+  syncSourceRow();
+  if (S.editor) renderEditPreview();
+  if (S.showMeta) renderMeta();
+}
+
+// the switch only means anything for a photo that has a negative behind it
+function syncSourceRow() {
+  const row = $("srcRow");
+  if (!row) return;
+  const raw = rawMemberPath(editorPhoto());
+  row.classList.toggle("hidden", !raw);
+  $("srcJpegBtn").classList.toggle("active", S.previewSrc !== "raw");
+  $("srcRawBtn").classList.toggle("active", S.previewSrc === "raw");
+}
+// the file the editor is currently rendering for `path` (its RAW twin, or itself)
+const renderPathFor = (path) => rawRenderPath(S.byPath.get(path)) || path;
+
 // Pass `editsObj` to render a live editor preview of those exact edits; omit it
 // to show the photo's stored edits.
 function previewUrl(p, editsObj) {
-  let u = "/api/preview?path=" + encodeURIComponent(p);
+  const raw = rawRenderPath(S.byPath.get(p));
+  const target = raw || p;
+  let u = "/api/preview?path=" + encodeURIComponent(target);
+  if (raw) u += "&full=1";   // decode the negative, don't lift its preview
   if (editsObj !== undefined) u += "&edits=" + encodeURIComponent(JSON.stringify(editsObj || {}));
-  else u += verSuffix(p);
+  else u += verSuffix(target);
   return u;
 }
 
@@ -391,7 +445,7 @@ function renderGrid() {
       `<img data-src="${thumbUrl(p.path)}" alt="" />` +
       `<div class="name">${escapeHtml(p.filename)}</div>` +
       typeBadge(p) +
-      (p.edits ? `<div class="editbadge" title="Edited">✎</div>` : "") +
+      (hasEdits(p) ? `<div class="editbadge" title="Edited">✎</div>` : "") +
       (cmpIdx >= 0 ? `<div class="cmpnum">${cmpIdx + 1}</div>` : "") +
       `<div class="badges"><span class="flag"></span><span class="stars">${starStr(p.rating)}</span></div>`;
     if (i === S.cursor) cell.classList.add("sel");
@@ -420,11 +474,11 @@ function refreshCell(i) {
   if (cmpIdx >= 0) cell.classList.add("cmp");
   cell.querySelector(".stars").textContent = starStr(p.rating);
   let eb = cell.querySelector(".editbadge");
-  if (p.edits && !eb) {
+  if (hasEdits(p) && !eb) {
     eb = document.createElement("div");
     eb.className = "editbadge"; eb.title = "Edited"; eb.textContent = "✎";
     cell.appendChild(eb);
-  } else if (!p.edits && eb) { eb.remove(); }
+  } else if (!hasEdits(p) && eb) { eb.remove(); }
   let num = cell.querySelector(".cmpnum");
   if (cmpIdx >= 0) {
     if (!num) { num = document.createElement("div"); num.className = "cmpnum"; cell.appendChild(num); }
@@ -714,9 +768,14 @@ function buildPanes() {
     pane.className = "pane";
     pane.dataset.idx = idx;
     const img = document.createElement("img");
-    img.src = previewUrl(path);
     img.draggable = false;
-    img.onload = () => { computeFit(idx, pane, img); applyTransform(); drawHistogram(); };
+    img.onload = () => {
+      if (idx === 0) paneBusy(null);
+      computeFit(idx, pane, img); applyTransform(); drawHistogram();
+    };
+    img.onerror = () => { if (idx === 0) paneBusy(null); };
+    if (idx === 0 && S.viewer.mode === "loupe") paneBusy(busyLabelFor(path));
+    img.src = previewUrl(path);
     const label = document.createElement("div");
     label.className = "plabel";
     pane.appendChild(label);
@@ -767,6 +826,51 @@ function buildPanes() {
   renderViewerMeta();
 }
 
+// A full RAW decode takes seconds and the pane would just sit there showing the
+// previous photo. Anything slower than a blink gets a badge saying what it is
+// waiting for; the delay keeps it off the screen for cached renders.
+let busyTimer = null;
+function paneBusy(text) {
+  clearTimeout(busyTimer);
+  const b = document.querySelector(".panebusy");
+  if (!text) { if (b) b.remove(); return; }
+  if (b) { b.querySelector(".panebusy-label").textContent = text; return; }
+  busyTimer = setTimeout(() => {
+    const pane = panesEl.children[0];
+    if (!pane || pane.querySelector(".panebusy")) return;
+    const el = document.createElement("div");
+    el.className = "panebusy";
+    el.innerHTML = `<span class="spinner"></span><span class="panebusy-label"></span>`;
+    el.querySelector(".panebusy-label").textContent = text;
+    pane.appendChild(el);
+  }, 150);
+}
+
+// Every path that puts an image in the loupe pane routes through here, so the
+// indicator can't be left running by one of them forgetting to clear it — the
+// bug that used to strand it whenever a load resolved from cache instead of
+// firing `onload`.
+function loadIntoPane(pane, url, done) {
+  const img = pane._img;
+  paneBusy(busyLabelFor(S.viewer.paths[S.viewer.cur]));
+  const finish = () => { paneBusy(null); done(); };
+  img.onerror = () => paneBusy(null);
+  img.onload = finish;
+  if (img.getAttribute("src") !== url) {
+    img.src = url;
+    if (img.complete && img.naturalWidth) finish();   // straight from cache
+  } else if (img.complete && img.naturalWidth) {
+    finish();
+  }
+}
+
+// what the loupe is about to wait for, in words. Keyed on the path rather than
+// the editor, because opening a photo sets the image going before the editor
+// has been rebound to it.
+const busyLabelFor = (path) =>
+  (S.previewSrc === "raw" && rawMemberPath(S.byPath.get(path)))
+    ? "Decoding negative…" : "Rendering…";
+
 function computeFit(idx, pane, img) {
   const PW = pane.clientWidth, PH = pane.clientHeight;
   const nw = img.naturalWidth, nh = img.naturalHeight;
@@ -811,6 +915,7 @@ function applyTransform() {
     img.style.transform =
       `translate(${cx}px, ${cy}px)${rot} scale(${scale}) translate(${-f.nw / 2}px, ${-f.nh / 2}px)`;
   }
+  if (S.spotMode) syncSpotOverlay();   // markers are positioned in pane pixels
 }
 
 function zoomAt(screenX, screenY, factor) {
@@ -895,11 +1000,9 @@ function loupeGo(i) {
   const pane = panesEl.children[0];
   const img = pane._img;
   img.style.filter = ""; img.style.border = "";   // drop any live edit layers
-  const url = previewUrl(v.paths[v.cur]);
-  img.onload = () => { computeFit(0, pane, img); applyTransform(); updateHud(); drawHistogram(); };
-  if (img.getAttribute("src") !== url) img.src = url;
-  // if it's already cached/complete, onload may not fire — fit now
-  if (img.complete && img.naturalWidth) computeFit(0, pane, img);
+  loadIntoPane(pane, previewUrl(v.paths[v.cur]), () => {
+    computeFit(0, pane, img); applyTransform(); updateHud(); drawHistogram();
+  });
   applyTransform();
   updateHud();
   // keep grid cursor in sync
@@ -927,7 +1030,19 @@ async function renderMeta() {
   el.classList.remove("hidden");
   el.innerHTML = `<div class="mrow"><span class="mkey">Loading…</span></div>`;
   try {
-    const m = await api("/api/meta?path=" + encodeURIComponent(p.path));
+    // Shooting data lives in the JPEG's EXIF, but the dimensions and file size
+    // have to describe whatever the loupe is actually rendering — in RAW view
+    // that is a different, larger file.
+    const raw = rawRenderPath(p);
+    const [m, rawMeta] = await Promise.all([
+      api("/api/meta?path=" + encodeURIComponent(p.path)),
+      raw ? api("/api/meta?path=" + encodeURIComponent(raw) + "&full=1").catch(() => null)
+          : Promise.resolve(null),
+    ]);
+    if (rawMeta) {
+      if (rawMeta.width) { m.width = rawMeta.width; m.height = rawMeta.height; }
+      m.size = rawMeta.size;
+    }
     const cur = currentPhoto();   // user may have navigated meanwhile
     if (!S.showMeta || !cur || cur.path !== p.path) return;
     const rows = [
@@ -937,6 +1052,7 @@ async function renderMeta() {
       ["Shutter", m.shutter],
       ["Aperture", m.aperture],
       ["ISO", m.iso && String(m.iso).replace(/^ISO /, "")],
+      ["Source", raw ? "RAW · " + raw.split(/[\\/]/).pop() : null],
       ["Size", m.width ? `${m.width} × ${m.height}` : null],
       ["File", m.size >= 1048576 ? (m.size / 1048576).toFixed(1) + " MB"
                                  : Math.round(m.size / 1024) + " KB"],
@@ -1055,24 +1171,58 @@ const getAutoOnlyMeans = (path) =>
 // plain-English diff of the edit stack vs. the untouched original — this is
 // what actually answers "what did auto (or anything else) change", the
 // histogram only shows the tonal shift that results from it
-function describeEdits(edits) {
+// One line per active adjustment, each tagged with the key it came from so the
+// panel can switch it off and on again. `edits.off` holds the ones that are
+// parked: the value is kept so toggling back restores exactly what was there.
+function describeEdits(edits, disabled) {
   if (!edits) return [];
   const out = [];
-  if (edits.rot) out.push(`Rotate ${edits.rot}°`);
-  if (edits.fine) out.push(`Straighten ${edits.fine > 0 ? "+" : ""}${edits.fine}°`);
-  if (edits.flipH) out.push("Flip horizontal");
-  if (edits.flipV) out.push("Flip vertical");
-  if (edits.crop) out.push("Cropped");
-  if (edits.auto) out.push("Auto-levels");
-  if (edits.wbR) out.push(`WB Red ${edits.wbR > 0 ? "+" : ""}${edits.wbR.toFixed(2)}`);
-  if (edits.wbB) out.push(`WB Blue ${edits.wbB > 0 ? "+" : ""}${edits.wbB.toFixed(2)}`);
-  if (edits.temp) out.push(`White balance (legacy) ${edits.temp > 0 ? "+" : ""}${edits.temp.toFixed(2)}`);
-  if (edits.bright != null && edits.bright !== 1) out.push(`Brightness ×${edits.bright.toFixed(2)}`);
-  if (edits.contrast != null && edits.contrast !== 1) out.push(`Contrast ×${edits.contrast.toFixed(2)}`);
-  if (edits.saturation != null && edits.saturation !== 1) out.push(`Saturation ×${edits.saturation.toFixed(2)}`);
-  if (edits.sharpness != null && edits.sharpness !== 1) out.push(`Sharpness ×${edits.sharpness.toFixed(2)}`);
-  if (edits.border && edits.border.w) out.push(`Border ${Math.round(edits.border.w * 100)}% ${edits.border.color}`);
+  const add = (key, text) => out.push({ key, text, off: !!disabled });
+  const num = (v) => `${v > 0 ? "+" : ""}${(+v).toFixed(2)}`;
+  if (edits.rot) add("rot", `Rotate ${edits.rot}°`);
+  if (edits.fine) add("fine", `Straighten ${edits.fine > 0 ? "+" : ""}${edits.fine}°`);
+  if (edits.flipH) add("flipH", "Flip horizontal");
+  if (edits.flipV) add("flipV", "Flip vertical");
+  if (edits.crop) add("crop", "Cropped");
+  if (edits.spots && edits.spots.length) {
+    add("spots", `Retouch: ${edits.spots.length} spot${edits.spots.length > 1 ? "s" : ""}`);
+  }
+  if (edits.auto) add("auto", "Auto-levels");
+  if (edits.bw) add("bw", "Black & white");
+  if (edits.temp) add("temp", `White balance (legacy) ${num(edits.temp)}`);
+  // the sliders describe themselves off the table, so a new adjustment shows up
+  // here — and becomes togglable — without being spelled out a second time
+  for (const key of ALL_SLIDER_KEYS) {
+    const v = edits[key];
+    const def = SLIDER_INFO[key];
+    if (v == null || v === def.neutral) continue;
+    const label = def.label.replace(/^\S+\s/, "");
+    add(key, def.neutral === 1 ? `${label} ×${(+v).toFixed(2)}` : `${label} ${num(v)}`);
+  }
+  if (edits.border && edits.border.w) {
+    add("border", `Border ${Math.round(edits.border.w * 100)}% ${edits.border.color}`);
+  }
   return out;
+}
+
+// Park one adjustment in `edits.off` (or bring it back) without disturbing the
+// rest — a per-change on/off switch, undoable like any other edit. Crop takes
+// the spots with it: they are positioned in the cropped frame, so leaving them
+// behind would heal the wrong pixels.
+function toggleEditKey(key) {
+  const e = clone(curEdits());
+  const off = clone(e.off || {});
+  const keys = key === "crop" ? ["crop", "spots"] : [key];
+  const disabling = e[key] !== undefined;
+  for (const k of keys) {
+    if (disabling) {
+      if (e[k] !== undefined) { off[k] = e[k]; delete e[k]; }
+    } else if (off[k] !== undefined) {
+      e[k] = off[k]; delete off[k];
+    }
+  }
+  if (Object.keys(off).length) e.off = off; else delete e.off;
+  pushEdit(e);
 }
 
 async function drawHistogram() {
@@ -1100,9 +1250,10 @@ async function drawHistogram() {
   }
 
   const p = editorPhoto();
-  const list = describeEdits(p ? p.edits : null);
+  const e = p ? p.edits : null;
+  const list = describeEdits(e).concat(describeEdits(e && e.off, true));
 
-  if (p && p.edits) {   // nothing to compare against when there are no edits
+  if (p && hasEdits(p)) {   // nothing to compare against when there are no edits
     const wantAuto = !!p.edits.auto;
     const [orig, autoMeans] = await Promise.all([
       getOrigStats(p.path),
@@ -1113,13 +1264,17 @@ async function drawHistogram() {
       drawHistCurve(ctx, orig.luma, w, h, "rgba(255,255,255,.85)", false);
       if (wantAuto && autoMeans) {
         const wb = fujiWbShift(orig.means, autoMeans);
-        if (wb) list.push(`Fuji WB to match Auto: ${wb} (approx.)`);
+        if (wb) list.push({ text: `Fuji WB to match Auto: ${wb} (approx.)` });
       }
     }
   }
 
   $("histChanges").innerHTML = list.length
-    ? list.map((s) => `<div class="hchg">${s}</div>`).join("")
+    ? list.map((c) => c.key
+        ? `<div class="hchg togglable${c.off ? " isoff" : ""}" data-key="${c.key}"` +
+          ` title="Click to switch this adjustment ${c.off ? "back on" : "off"}">` +
+          `<span class="hchk">${c.off ? "☐" : "☑"}</span>${escapeHtml(c.text)}</div>`
+        : `<div class="hchg">${escapeHtml(c.text)}</div>`).join("")
     : `<div class="hchg muted">No edits — this is the original</div>`;
 }
 
@@ -1160,6 +1315,7 @@ function updateHud() {
 }
 
 function closeViewer() {
+  paneBusy(null);
   S.viewer = null;
   S.editor = null; S.cropMode = false;
   const ov = document.getElementById("cropOverlay");
@@ -1182,6 +1338,11 @@ window.addEventListener("resize", refitPanes);
 // persisted per-photo. Originals are never written — Reset fully reverts.
 // ---------------------------------------------------------------------------
 const clone = (o) => JSON.parse(JSON.stringify(o || {}));
+// `edits.off` holds adjustments the user switched off from the change list. It
+// has to be stored (that is the only copy of the parked values) but it changes
+// nothing about the picture, so a stack holding only `off` is not an edit.
+const hasEdits = (p) =>
+  !!(p && p.edits && Object.keys(p.edits).some((k) => k !== "off"));
 const editorPhoto = () => (S.editor ? S.byPath.get(S.editor.path) : null);
 function curEdits() {
   const p = editorPhoto();
@@ -1194,6 +1355,7 @@ function bindEditor(path) {
   const p = S.byPath.get(path);
   if (!p) return;
   if (S.cropMode) exitCropMode(false);   // no re-render — we're rebinding anyway
+  if (S.spotMode) exitRetouch(false);    // spots belong to the photo we're leaving
   if (!p._hist) { p._hist = [clone(p.edits)]; p._hidx = 0; }
   S.editor = { path, showOrig: false };
   $("editBar").classList.remove("hidden");
@@ -1212,10 +1374,10 @@ function pushEdit(edits) {
   p._hidx = p._hist.length - 1;
   commitEdit();
 }
-function undoEdit() { const p = editorPhoto(); if (p && p._hist && p._hidx > 0) { p._hidx--; commitEdit(true); } }
-function redoEdit() { const p = editorPhoto(); if (p && p._hist && p._hidx < p._hist.length - 1) { p._hidx++; commitEdit(true); } }
+function undoEdit() { const p = editorPhoto(); if (p && p._hist && p._hidx > 0) { p._hidx--; commitEdit(); } }
+function redoEdit() { const p = editorPhoto(); if (p && p._hist && p._hidx < p._hist.length - 1) { p._hidx++; commitEdit(); } }
 
-async function commitEdit(syncControls) {
+async function commitEdit() {
   const p = editorPhoto();
   if (!p) return;
   if (S.cropMode) exitCropMode(false);   // edits changed under the overlay — drop it
@@ -1223,14 +1385,35 @@ async function commitEdit(syncControls) {
   const edits = curEdits();
   p.edits = (edits && Object.keys(edits).length) ? clone(edits) : null;
   p._ev = (p._ev || 0) + 1;   // bust browser cache for thumb/stored preview
-  if (syncControls) syncEditControls();
+  // the stack may have been replaced wholesale (preset, paste, reset, undo, a
+  // parked change switched back on), so the panel is resynced on every commit —
+  // for a slider-driven edit this just writes back what the slider already shows
+  syncEditControls();
   renderEditPreview();
   const vi = S.view.indexOf(p);
   if (vi >= 0) refreshCell(vi);
   try {
-    await post("/api/edit", { path: p.path, edits: p.edits });
+    await Promise.all(editTargets(p).map((tp) =>
+      post("/api/edit", { path: tp, edits: p.edits })));
     refreshThumb(p);   // only after the server knows the new edits (avoids a stale fetch)
   } catch (err) { toast("Edit save failed: " + err.message); }
+}
+
+// A RAW+JPEG pair is one photo to the person editing it, but two rows on disk
+// and in the DB — and the JPEG is the one the editor is bound to. Mirror the
+// stack onto every member (the same thing mark() does with flags) so the RAW
+// carries the changes too: its own preview shows them, exporting it renders
+// them, and turning grouping off doesn't reveal an unedited twin.
+function editTargets(p) {
+  const paths = (p.members && p.members.length) ? p.members : [p.path];
+  for (const tp of paths) {
+    const t = S.byPath.get(tp);
+    if (!t || t === p) continue;
+    t.edits = p.edits ? clone(p.edits) : null;
+    t._hist = null; t._hidx = 0;    // its own history would now be a lie
+    t._ev = (t._ev || 0) + 1;
+  }
+  return paths;
 }
 
 // re-fetch a photo's grid thumbnail after its stored edits changed
@@ -1250,9 +1433,18 @@ function renderEditPreview(overrideEdits, keepLive) {
   const pane = panesEl.children[0];
   if (!pane || !S.editor) return;
   const img = pane._img;
-  const edits = overrideEdits !== undefined ? overrideEdits : curEdits();
+  let edits = overrideEdits !== undefined ? overrideEdits : curEdits();
+  // spots are normalized against the un-bordered frame — the same one the
+  // retouch overlay draws on — so the border comes off while placing them
+  if (S.spotMode && overrideEdits === undefined && edits && edits.border) {
+    edits = clone(edits);
+    delete edits.border;
+  }
   const url = previewUrl(S.editor.path, edits);
+  paneBusy(busyLabelFor(S.editor.path));
+  img.onerror = () => paneBusy(null);
   img.onload = () => {
+    paneBusy(null);
     if (!keepLive) {   // keepLive: a drag is in progress, its live layer stays
       img.style.filter = ""; img.style.border = "";
       if (S.editor) S.editor.liveFine = 0;
@@ -1271,7 +1463,7 @@ function renderEditPreview(overrideEdits, keepLive) {
 function toggleOriginal() {
   const p = editorPhoto();
   if (!p) return;
-  if (!S.editor.showOrig && !p.edits) { toast("No edits — this is the original"); return; }
+  if (!S.editor.showOrig && !hasEdits(p)) { toast("No edits — this is the original"); return; }
   if (S.cropMode) exitCropMode(false);
   S.editor.showOrig = !S.editor.showOrig;
   $("origBtn").classList.toggle("active", S.editor.showOrig);
@@ -1283,9 +1475,11 @@ function toggleOriginal() {
 async function saveCopy() {
   const p = editorPhoto();
   if (!p) return;
-  if (!p.edits) { toast("No edits to save"); return; }
+  if (!hasEdits(p)) { toast("No edits to save"); return; }
+  toast(rawRenderPath(p) ? "Rendering from the negative…" : "Saving…", 4000);
   try {
-    const res = await post("/api/save-copy", { path: p.path });
+    const res = await post("/api/save-copy",
+                           { path: p.path, source: rawRenderPath(p) || p.path });
     const np = res.photo;
     np.ext = extOf(np.filename);
     np.edits = null;
@@ -1308,13 +1502,26 @@ function syncEditControls() {
   });
   $("fineR").value = e.fine || 0;
   $("fineRNum").value = e.fine || 0;
-  $("autoBtn").classList.toggle("active", !!e.auto);
   const b = e.border || {};
   $("borderW").value = b.w || 0;
   $("borderWNum").value = Math.round((b.w || 0) * 1000) / 10;
   $("borderC").value = b.color || "#ffffff";
+  syncEditBadges();
+}
+
+// The on/off buttons and the spot count are derived from the edit stack, so
+// they have to refresh on every commit — not only when the sliders are resynced
+// (undo/redo), which is how a cleared spot list used to leave a stale count.
+function syncEditBadges() {
+  const e = curEdits();
+  $("autoBtn").classList.toggle("active", !!e.auto);
   $("cropBtn").classList.toggle("active", !!e.crop || S.cropMode);
+  $("bwBtn").classList.toggle("active", !!e.bw);
+  $("retouchBtn").classList.toggle("active", S.spotMode);
+  $("retouchBtn").textContent = (e.spots && e.spots.length)
+    ? `\u{1FA79} Retouch (${e.spots.length})` : "\u{1FA79} Retouch";
   $("origBtn").classList.toggle("active", !!(S.editor && S.editor.showOrig));
+  syncSourceRow();
 }
 
 function editAction(act) {
@@ -1322,11 +1529,11 @@ function editAction(act) {
   if (act === "rotL" || act === "rotR") {
     const n = clone(e);
     n.rot = (((n.rot || 0) + (act === "rotR" ? 90 : 270)) % 360);
-    delete n.crop;   // crop coords are tied to the old rotation — drop them
-    pushEdit(n); return;
+    delete n.crop;    // crop coords are tied to the old rotation — drop them
+    pushEdit(dropSpots(n, e)); return;
   }
   if (act === "flipH" || act === "flipV") {
-    const n = clone(e); n[act] = !n[act]; delete n.crop; pushEdit(n); return;
+    const n = clone(e); n[act] = !n[act]; delete n.crop; pushEdit(dropSpots(n, e)); return;
   }
   if (act === "crop") { S.cropMode ? exitCropMode() : enterCropMode(); return; }
   if (act === "grid") return toggleGrid();
@@ -1335,6 +1542,27 @@ function editAction(act) {
     const n = clone(e);
     if (n.auto) delete n.auto; else n.auto = true;
     pushEdit(n); return;
+  }
+  if (act === "bw") {
+    const n = clone(e);
+    if (n.bw) delete n.bw; else n.bw = true;
+    pushEdit(n); return;
+  }
+  if (act === "lensReset") {
+    const n = clone(e);
+    let any = false;
+    for (const k of ["distort", "ca", "persV", "persH"]) {
+      if (n[k] != null) { delete n[k]; any = true; }
+    }
+    if (!any) { toast("No lens corrections to clear"); return; }
+    pushEdit(dropSpots(n, e)); return;
+  }
+  if (act === "srcJpeg") return setPreviewSrc("jpeg");
+  if (act === "srcRaw") return setPreviewSrc("raw");
+  if (act === "retouch") return toggleRetouch();
+  if (act === "spotClear") {
+    if (!e.spots || !e.spots.length) { toast("No spots to clear"); return; }
+    const n = clone(e); delete n.spots; pushEdit(n); return;
   }
   if (act === "undo") return undoEdit();
   if (act === "redo") return redoEdit();
@@ -1367,7 +1595,7 @@ function pasteEdits() {
 
 function copyEditsFromGrid() {
   const p = S.view[activeIndex()];
-  if (!p || !p.edits) { toast("No edits to copy"); return; }
+  if (!p || !hasEdits(p)) { toast("No edits to copy"); return; }
   copiedEdits = clone(p.edits);
   updatePasteBtn();
   toast("Edits copied — select photos (Space) and Ctrl+V, or paste onto one");
@@ -1402,7 +1630,8 @@ async function applyEditsToSelection(edits, label) {
   }
   const n = targets.length;
   try {
-    await Promise.all(targets.map((path) =>
+    const all = [].concat(...targets.map((path) => editTargets(S.byPath.get(path))));
+    await Promise.all(all.map((path) =>
       post("/api/edit", { path, edits: S.byPath.get(path).edits })));
     targets.forEach((path) => refreshThumb(S.byPath.get(path)));
     toast(`Applied ${label} to ${n} photo${n === 1 ? "" : "s"}`);
@@ -1508,8 +1737,8 @@ function fineCommit() {
   if (v === (cur.fine || 0)) { renderEditPreview(); return; }   // unchanged — settle back
   const n = clone(cur);
   if (v) n.fine = v; else delete n.fine;
-  delete n.crop;   // crop coords are tied to the old geometry — drop them
-  pushEdit(n);
+  delete n.crop;    // crop coords are tied to the old geometry — drop them
+  pushEdit(dropSpots(n, cur));
   $("fineR").blur(); $("fineRNum").blur();
 }
 
@@ -1557,10 +1786,69 @@ function borderCommit() {
 // bright/contrast/saturation map to CSS filters; wbR/wbB are an exact
 // feColorMatrix (same independent R/B gains as the server); sharpness is an
 // feConvolveMatrix built from the same blend PIL uses (identity·v + SMOOTH·(1-v)).
-const LIVE_KEYS = ["bright", "contrast", "saturation", "sharpness", "wbR", "wbB"];
-const neutralOf = (k) => (k === "wbR" || k === "wbB" ? 0 : 1);
+// Every tonal/lens slider in one table, and the sidebar rows are generated
+// from it — a new adjustment is one row here, not a block of markup plus four
+// places that have to learn its name.
+//   live "css": previewable with a CSS/SVG filter while dragging (exact or
+//               near enough that the server render doesn't visibly jump)
+//   live "srv": no CSS equivalent — the server renders a draft while dragging
+const SLIDER_DEFS = [
+  // group,     key,          label,               min,  max, step, neutral, live, ticks
+  ["lens",    "distort",   "\u{1F6E2} Distortion",   -0.5,  0.5, 0.01, 0, "srv", 11],
+  ["lens",    "ca",        "\u{1F308} Chromatic ab.",  -1,    1, 0.02, 0, "srv", 11],
+  ["lens",    "persV",     "\u2195 Perspective V",     -1,    1, 0.02, 0, "srv", 11],
+  ["lens",    "persH",     "\u2194 Perspective H",     -1,    1, 0.02, 0, "srv", 11],
+
+  ["light",   "exposure",  "\u2600 Exposure",          -3,    3, 0.05, 0, "css", 13],
+  ["light",   "contrast",  "\u25D0 Contrast",         0.2,    2, 0.02, 1, "css", 10],
+  ["light",   "highlights","\u25B2 Highlights",        -1,    1, 0.02, 0, "srv", 11],
+  ["light",   "shadows",   "\u25BC Shadows",           -1,    1, 0.02, 0, "srv", 11],
+  ["light",   "whites",    "\u25A1 Whites",            -1,    1, 0.02, 0, "srv", 11],
+  ["light",   "blacks",    "\u25A0 Blacks",            -1,    1, 0.02, 0, "srv", 11],
+  ["light",   "bright",    "\u{1F506} Brightness",    0.2,    2, 0.02, 1, "css", 10],
+
+  ["color",   "wbR",       "\u{1F534} WB Red",         -1,    1, 0.02, 0, "css", 11],
+  ["color",   "wbB",       "\u{1F535} WB Blue",        -1,    1, 0.02, 0, "css", 11],
+  ["color",   "vibrance",  "\u{1F321} Vibrance",       -1,    1, 0.02, 0, "srv", 11],
+  ["color",   "saturation","\u{1F3A8} Saturation",      0,    2, 0.02, 1, "css", 11],
+
+  ["detail",  "clarity",   "\u25CE Clarity",           -1,    1, 0.02, 0, "srv", 11],
+  ["detail",  "sharpness", "\u{1F52A} Sharpness",       0,    3, 0.05, 1, "css", 13],
+  ["detail",  "denoise",   "\u224B Noise reduction",    0,    1, 0.02, 0, "srv", 11],
+
+  ["effects", "vignette",  "\u25CD Vignette",          -1,    1, 0.02, 0, "srv", 11],
+  ["effects", "grain",     "\u25A8 Grain",              0,    1, 0.02, 0, "srv", 11],
+];
+const SLIDER_INFO = {};
+SLIDER_DEFS.forEach((d) => {
+  SLIDER_INFO[d[1]] = { group: d[0], key: d[1], label: d[2], min: d[3], max: d[4],
+                        step: d[5], neutral: d[6], live: d[7], ticks: d[8] };
+});
+const LIVE_KEYS = SLIDER_DEFS.filter((d) => d[7] === "css").map((d) => d[1]);
+const ALL_SLIDER_KEYS = SLIDER_DEFS.map((d) => d[1]);
+const neutralOf = (k) => (SLIDER_INFO[k] ? SLIDER_INFO[k].neutral : 0);
+
+function buildSliders() {
+  document.querySelectorAll("#editBar [data-sliders]").forEach((host) => {
+    host.innerHTML = SLIDER_DEFS.filter((d) => d[0] === host.dataset.sliders).map((d) => {
+      const [, key, label, min, max, step, neutral] = d;
+      return `<div class="ed-row">
+        <div class="ed-head"><span class="ed-label">${label}</span>
+          <input type="number" class="num" data-num="${key}" min="${min}" max="${max}"
+                 step="${step}" value="${neutral.toFixed(2)}" /></div>
+        <datalist id="tick_${key}"></datalist>
+        <input type="range" data-edit="${key}" min="${min}" max="${max}" step="${step}"
+               value="${neutral}" list="tick_${key}" title="double-click to reset" />
+      </div>`;
+    }).join("");
+  });
+  SLIDER_DEFS.forEach((d) => fillTicks("tick_" + d[1], d[3], d[4], d[8]));
+}
+buildSliders();
+
 let sliderDragging = false;
 
+// the edit stack minus everything the live CSS filter is about to stand in for
 function geomEdits() {
   const e = clone(curEdits());
   for (const k of LIVE_KEYS) delete e[k];
@@ -1578,7 +1866,10 @@ function liveFilter() {
       `${1 + 0.3 * wr} 0 0 0 0  0 1 0 0 0  0 0 ${1 + 0.3 * wb} 0 0  0 0 0 1 0`);
     parts.push("url(#liveWB)");
   }
-  parts.push(`brightness(${sliderVal("bright")}) contrast(${sliderVal("contrast")}) ` +
+  // exposure is a linear-light multiply on the server and a plain gain here;
+  // close enough over a drag that the baked render doesn't visibly jump
+  const gain = Math.pow(2, sliderVal("exposure")) * sliderVal("bright");
+  parts.push(`brightness(${gain.toFixed(4)}) contrast(${sliderVal("contrast")}) ` +
              `saturate(${sliderVal("saturation")})`);
   const s = sliderVal("sharpness");
   if (Math.abs(s - 1) > 1e-6) {
@@ -1589,26 +1880,60 @@ function liveFilter() {
   }
   return parts.join(" ");
 }
+// Retouch spots are positioned on the final frame, so anything upstream that
+// moves pixels (rotate, straighten, lens correction) leaves them healing the
+// wrong place. Crop is remapped instead (remapSpots); the rest drop the spots,
+// and say so — a silently misplaced heal is worse than a lost one.
+function dropSpots(next, prev) {
+  if (!prev || !prev.spots || !prev.spots.length) return next;
+  delete next.spots;
+  toast("Geometry changed \u2014 retouch spots cleared");
+  return next;
+}
+
+// the edit stack with one slider's value swapped in (neutral = key removed)
+function editsWith(inp, announce) {
+  const n = clone(curEdits());
+  const key = inp.dataset.edit, val = parseFloat(inp.value);
+  if (Math.abs(val - neutralOf(key)) < 1e-6) delete n[key]; else n[key] = val;
+  const def = SLIDER_INFO[key];
+  if (def && def.group === "lens" && n.spots) {
+    if (announce) dropSpots(n, curEdits()); else delete n.spots;
+  }
+  return n;
+}
+
+// Sliders with no CSS equivalent (highlights/shadows, lens, vignette, grain…)
+// preview by asking the server for a draft render, debounced to one in flight
+// per pause. The draft comes off the RAM-cached 2400px base, so it lands in
+// well under the time it takes to move to the next slider.
+let srvTimer = null;
+function srvSliderInput(inp) {
+  if (!S.editor) return;
+  const n = editsWith(inp);
+  clearTimeout(srvTimer);
+  srvTimer = setTimeout(() => { if (S.editor) renderEditPreview(n); }, 130);
+}
+
 function sliderInput(inp) {
   const num = inp.parentElement.querySelector("input.num");
   if (num) num.value = parseFloat(inp.value).toFixed(2);
   const pane = panesEl.children[0];
   if (!pane || !S.editor) return;
+  const def = SLIDER_INFO[inp.dataset.edit];
+  if (def && def.live === "srv") { srvSliderInput(inp); return; }
   // first move: drop the baked-in tonal layer so the live filter isn't doubled
   if (!sliderDragging) { sliderDragging = true; renderEditPreview(geomEdits(), true); }
   pane._img.style.filter = liveFilter();
 }
 function sliderCommit(inp) {
   sliderDragging = false;
+  clearTimeout(srvTimer);
   // the slider may have been set programmatically (double-click reset), so the
   // numeric twin has to be re-synced here, not only while dragging
   const num = inp.parentElement.querySelector("input.num");
   if (num) num.value = parseFloat(inp.value).toFixed(2);
-  const n = clone(curEdits());
-  const val = parseFloat(inp.value);
-  const key = inp.dataset.edit;
-  if (Math.abs(val - neutralOf(key)) < 1e-6) delete n[key]; else n[key] = val;
-  pushEdit(n);   // server bakes the real result; live filter stays until it loads
+  pushEdit(editsWith(inp, true));   // server bakes the real result; live filter stays until it loads
   inp.blur();    // release focus so arrow keys go back to navigation
 }
 
@@ -1638,6 +1963,7 @@ function syncGridOverlay() {
 // ---- crop: drag a box on the (un-cropped, un-bordered) rotated frame ----
 function enterCropMode() {
   if (!S.editor) return;
+  if (S.spotMode) exitRetouch(false);   // about to render its own frame anyway
   if (S.editor.showOrig) { S.editor.showOrig = false; $("origBtn").classList.remove("active"); }
   S.cropMode = true;
   $("cropBtn").classList.add("active");
@@ -1689,6 +2015,21 @@ function buildCropOverlay(pane) {
   const clampX = (x) => Math.max(imgL, Math.min(imgL + imgW, x));
   const clampY = (y) => Math.max(imgT, Math.min(imgT + imgH, y));
 
+  // Snap the dragged corner to the chosen aspect ratio, then shrink whatever
+  // spills past the edge of the image. The pane scale is uniform, so a ratio
+  // held in screen pixels is the same ratio in image pixels.
+  const fixAspect = (x0, y0, x1, y1) => {
+    const ar = cropAspectRatio();
+    if (!ar) return [x1, y1];
+    const sgx = x1 >= x0 ? 1 : -1, sgy = y1 >= y0 ? 1 : -1;
+    let w = Math.abs(x1 - x0), h = Math.abs(y1 - y0);
+    if (w > h * ar) h = w / ar; else w = h * ar;
+    const maxW = sgx > 0 ? imgL + imgW - x0 : x0 - imgL;
+    const maxH = sgy > 0 ? imgT + imgH - y0 : y0 - imgT;
+    const k = Math.min(1, maxW / Math.max(w, 1e-6), maxH / Math.max(h, 1e-6));
+    return [x0 + sgx * w * k, y0 + sgy * h * k];
+  };
+
   let drag = false, sx = 0, sy = 0;
   ov.addEventListener("mousedown", (e) => {
     e.preventDefault(); e.stopPropagation();
@@ -1701,14 +2042,14 @@ function buildCropOverlay(pane) {
   ov.addEventListener("mousemove", (e) => {
     if (!drag) return;
     const r = ov.getBoundingClientRect();
-    const cx = clampX(e.clientX - r.left), cy = clampY(e.clientY - r.top);
+    const [cx, cy] = fixAspect(sx, sy, clampX(e.clientX - r.left), clampY(e.clientY - r.top));
     sel.style.left = Math.min(sx, cx) + "px"; sel.style.top = Math.min(sy, cy) + "px";
     sel.style.width = Math.abs(cx - sx) + "px"; sel.style.height = Math.abs(cy - sy) + "px";
   });
   ov.addEventListener("mouseup", (e) => {
     if (!drag) return; drag = false;
     const r = ov.getBoundingClientRect();
-    const cx = clampX(e.clientX - r.left), cy = clampY(e.clientY - r.top);
+    const [cx, cy] = fixAspect(sx, sy, clampX(e.clientX - r.left), clampY(e.clientY - r.top));
     const x0 = Math.min(sx, cx), y0 = Math.min(sy, cy);
     const x1 = Math.max(sx, cx), y1 = Math.max(sy, cy);
     if (x1 - x0 < 8 || y1 - y0 < 8) { toast("Crop too small"); return; }
@@ -1716,10 +2057,288 @@ function buildCropOverlay(pane) {
                   (x1 - imgL) / imgW, (y1 - imgT) / imgH]
                  .map((n) => Math.max(0, Math.min(1, +n.toFixed(4))));
     S.cropMode = false; $("cropBtn").classList.remove("active"); ov.remove();
-    const n = clone(curEdits()); n.crop = crop;
+    const cur = curEdits();
+    const n = clone(cur);
+    const moved = remapSpots(cur.spots, cur.crop, crop, f.nw, f.nh);
+    if (moved && moved.length) n.spots = moved; else delete n.spots;
+    n.crop = crop;
     pushEdit(n);
   });
 }
+
+// Retouch spots are stored in the *cropped* frame, so re-cropping would slide
+// them off their blemishes. Map them through the old crop into the new one
+// instead of quietly throwing the retouch work away; spots that fall outside
+// the new frame are dropped because there is nothing left for them to fix.
+function remapSpots(spots, oldCrop, newCrop, nw, nh) {
+  if (!spots || !spots.length) return spots;
+  const o = oldCrop && oldCrop.length === 4 ? oldCrop : [0, 0, 1, 1];
+  const ow = o[2] - o[0], oh = o[3] - o[1];
+  const cw = newCrop[2] - newCrop[0], ch = newCrop[3] - newCrop[1];
+  if (cw <= 0 || ch <= 0 || ow <= 0 || oh <= 0) return spots;
+  // the radius is a fraction of the frame's short edge, which just changed
+  const rk = Math.min(ow * nw, oh * nh) / Math.min(cw * nw, ch * nh);
+  const mx = (x) => (o[0] + x * ow - newCrop[0]) / cw;
+  const my = (y) => (o[1] + y * oh - newCrop[1]) / ch;
+  return spots
+    .map((s) => Object.assign({}, s, { x: mx(s.x), y: my(s.y),
+                                       sx: mx(s.sx), sy: my(s.sy), r: s.r * rk }))
+    .filter((s) => s.x > 0 && s.x < 1 && s.y > 0 && s.y < 1);
+}
+
+function cropAspectRatio() {
+  const v = $("cropAspect").value;
+  if (!v) return 0;
+  if (v === "orig") {
+    const f = S.viewer && S.viewer._fit[0];
+    return f && f.nh ? f.nw / f.nh : 0;
+  }
+  return parseFloat(v) || 0;
+}
+
+// ---- retouch: brush over what you want gone, or tap a single blemish ----
+// A retouch entry is a painted path plus one source offset:
+//   {pts: [[x, y], …], r, dx, dy, mode}
+// One point is a spot, several are a stroke, and the renderer treats them the
+// same. Coordinates are normalized against the displayed (cropped, un-bordered)
+// frame — what you paint on is exactly what the server heals, at any zoom.
+let paint = null;        // the stroke being drawn
+let spotCursor = null;   // {x, y} in pane pixels — where the brush ring is drawn
+
+function spotRadius() {
+  return Math.max(0.005, Math.min(0.15, parseFloat($("spotSize").value) || 0.03));
+}
+const spotTool = () => $("spotTool").value;          // "brush" | "spot"
+
+function toggleRetouch(on) {
+  const want = on === undefined ? !S.spotMode : !!on;
+  if (want && !S.editor) return;
+  if (want === S.spotMode) return;
+  if (want && S.cropMode) exitCropMode(false);
+  S.spotMode = want;
+  $("retouchBtn").classList.toggle("active", want);
+  if (want && S.editor && S.editor.showOrig) {
+    S.editor.showOrig = false; $("origBtn").classList.remove("active");
+  }
+  renderEditPreview();            // border comes off / goes back on
+  if (!want) {
+    paint = null; spotCursor = null;
+    const ov = document.getElementById("spotOverlay");
+    if (ov) ov.remove();
+  } else {
+    // park the brush ring in the middle of the pane so its size is visible the
+    // moment the mode turns on, before the mouse has moved
+    const pane = panesEl.children[0];
+    if (pane) spotCursor = { x: pane.clientWidth / 2, y: pane.clientHeight / 2 };
+    toast(spotTool() === "brush"
+      ? "Brush over what you want gone — Esc exits"
+      : "Click a blemish — the source is picked for you — Esc exits", 2600);
+  }
+}
+
+function exitRetouch(rerender = true) {
+  if (!S.spotMode) return;
+  S.spotMode = false;
+  paint = null; spotCursor = null;
+  $("retouchBtn").classList.remove("active");
+  const ov = document.getElementById("spotOverlay");
+  if (ov) ov.remove();
+  if (rerender && S.editor) renderEditPreview();
+}
+
+// pane pixels <-> normalized image coords, inverting the CSS transform that
+// applyTransform() writes (fit scale, zoom, pan)
+function paneToImg(f, px, py) {
+  const s = f.fit * S.viewer.zoom;
+  return [((px - f.PW / 2 - S.viewer.panx) / s + f.nw / 2) / f.nw,
+          ((py - f.PH / 2 - S.viewer.pany) / s + f.nh / 2) / f.nh];
+}
+function imgToPane(f, u, v) {
+  const s = f.fit * S.viewer.zoom;
+  return [f.PW / 2 + S.viewer.panx + (u * f.nw - f.nw / 2) * s,
+          f.PH / 2 + S.viewer.pany + (v * f.nh - f.nh / 2) * s];
+}
+
+function syncSpotOverlay() {
+  const pane = panesEl.children[0];
+  if (!pane || !S.viewer || S.viewer.mode !== "loupe") return;
+  let ov = document.getElementById("spotOverlay");
+  if (!S.spotMode) { if (ov) ov.remove(); return; }
+  if (!ov) {
+    ov = document.createElement("div");
+    ov.id = "spotOverlay";
+    ov.className = "spotoverlay";
+    attachSpotHandlers(ov);
+  }
+  if (ov.parentElement !== pane) pane.appendChild(ov);
+  drawSpotMarkers(ov);
+}
+
+// one painted region, drawn at the brush width: a round-capped polyline, or a
+// circle when there is only the single point a tap leaves behind
+function regionSvg(f, entry, wide, cls) {
+  const pts = entry.pts || [[entry.x, entry.y]];
+  const xy = pts.map((p) => imgToPane(f, p[0], p[1]));
+  if (xy.length < 2) {
+    return `<circle cx="${xy[0][0]}" cy="${xy[0][1]}" r="${wide / 2}" class="${cls}" />`;
+  }
+  return `<polyline points="${xy.map((p) => p[0] + "," + p[1]).join(" ")}" ` +
+         `class="${cls}" style="stroke-width:${wide}" />`;
+}
+
+function drawSpotMarkers(ov) {
+  const f = S.viewer && S.viewer._fit[0];
+  if (!f) return;
+  const shortPx = Math.min(f.nw, f.nh) * f.fit * S.viewer.zoom;
+  const entries = (curEdits().spots || []).slice();
+  let svg = entries.map((e) =>
+    regionSvg(f, e, Math.max(4, 2 * e.r * shortPx), "spotregion")).join("");
+  if (paint) {
+    svg += regionSvg(f, paint, Math.max(4, 2 * paint.r * shortPx), "spotpainting");
+    // the spot tool's drag picks a source instead of painting, so show where from
+    if (paint.src) {
+      const [px, py] = imgToPane(f, paint.pts[0][0], paint.pts[0][1]);
+      const [sx, sy] = imgToPane(f, paint.src[0], paint.src[1]);
+      const rr = Math.max(2, paint.r * shortPx);
+      svg += `<line x1="${sx}" y1="${sy}" x2="${px}" y2="${py}" class="spotlink" />` +
+             `<circle cx="${sx}" cy="${sy}" r="${rr}" class="spotsrc" />`;
+    }
+  } else if (spotCursor) {
+    // the brush itself: a ring at the pointer, at the size the next stroke uses
+    svg += `<circle cx="${spotCursor.x}" cy="${spotCursor.y}" ` +
+           `r="${Math.max(2, spotRadius() * shortPx)}" class="spotbrush" />`;
+  }
+  ov.innerHTML = `<svg class="spotsvg">${svg}</svg>`;
+}
+
+// redraw the brush ring without touching anything else (brush-size slider)
+function refreshSpotBrush() {
+  const ov = document.getElementById("spotOverlay");
+  if (S.spotMode && ov) drawSpotMarkers(ov);
+}
+
+// clicking inside a painted region removes it. Points along a stroke are laid
+// down closer together than the brush radius, so nearest-point is the same
+// answer as distance-to-path without the segment maths.
+function regionAt(f, u, v) {
+  const entries = curEdits().spots || [];
+  const short = Math.min(f.nw, f.nh);
+  return entries.findIndex((e) =>
+    (e.pts || [[e.x, e.y]]).some((p) =>
+      Math.hypot((u - p[0]) * f.nw / short, (v - p[1]) * f.nh / short) <= e.r));
+}
+
+function attachSpotHandlers(ov) {
+  const at = (e) => {
+    const f = S.viewer && S.viewer._fit[0];
+    const r = ov.getBoundingClientRect();
+    return f ? paneToImg(f, e.clientX - r.left, e.clientY - r.top) : null;
+  };
+  ov.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;   // middle/right fall through to the pane's pan
+    e.preventDefault(); e.stopPropagation();
+    const f = S.viewer && S.viewer._fit[0];
+    const p = at(e);
+    if (!f || !p) return;
+    const hit = regionAt(f, p[0], p[1]);
+    if (hit >= 0) {               // clicking a painted region removes it
+      const n = clone(curEdits());
+      n.spots = (n.spots || []).filter((_, i) => i !== hit);
+      if (!n.spots.length) delete n.spots;
+      pushEdit(n);
+      return;
+    }
+    paint = { pts: [p], r: spotRadius(), mode: $("spotModeSel").value,
+              tool: spotTool(), src: null, ox: e.clientX, oy: e.clientY, moved: false };
+    drawSpotMarkers(ov);
+  });
+  ov.addEventListener("mousemove", (e) => {
+    const r = ov.getBoundingClientRect();
+    spotCursor = { x: e.clientX - r.left, y: e.clientY - r.top };
+    if (!paint) drawSpotMarkers(ov);
+  });
+  ov.addEventListener("mouseleave", () => {
+    spotCursor = null;
+    if (!paint) drawSpotMarkers(ov);
+  });
+  ov.addEventListener("dblclick", (e) => e.stopPropagation());   // don't reset zoom
+}
+
+// Ask the server where to source a painted region from. It scores candidates
+// around the region on the preview-size frame and we store the answer, so the
+// render stays a pure function of the saved numbers — searching again at export
+// resolution could pick a different area and disagree with the preview.
+async function planPaint(p) {
+  if (!S.editor) return null;
+  const e = clone(curEdits());
+  delete e.border;    // the overlay is drawn on the un-bordered frame
+  try {
+    const raw = rawRenderPath(editorPhoto());
+    return await post("/api/plan-paint",
+                      { path: raw || S.editor.path, pts: p.pts, r: p.r,
+                        edits: e, full: !!raw });
+  } catch (err) {
+    return null;
+  }
+}
+
+window.addEventListener("mousemove", (e) => {
+  if (!paint) return;
+  const ov = document.getElementById("spotOverlay");
+  const f = S.viewer && S.viewer._fit[0];
+  if (!ov || !f) return;
+  if (Math.hypot(e.clientX - paint.ox, e.clientY - paint.oy) > 3) paint.moved = true;
+  const r = ov.getBoundingClientRect();
+  const [u, v] = paneToImg(f, e.clientX - r.left, e.clientY - r.top);
+  if (paint.tool === "brush") {
+    // thin the path out: dabs closer than a third of the brush add nothing but
+    // work for the mask, and the server needs a path, not a mouse recording
+    const last = paint.pts[paint.pts.length - 1];
+    const short = Math.min(f.nw, f.nh);
+    if (Math.hypot((u - last[0]) * f.nw / short, (v - last[1]) * f.nh / short) > paint.r / 3) {
+      paint.pts.push([u, v]);
+    }
+  } else {
+    paint.src = [u, v];   // the spot tool drags out a source instead
+  }
+  drawSpotMarkers(ov);
+});
+
+window.addEventListener("mouseup", async () => {
+  const p = paint;
+  if (!p) return;
+  paint = null;
+  const f = S.viewer && S.viewer._fit[0];
+  if (!f || !S.editor) return;
+  const short = Math.min(f.nw, f.nh);
+
+  let dx, dy;
+  if (p.tool === "spot" && p.moved && p.src) {
+    dx = p.src[0] - p.pts[0][0];
+    dy = p.src[1] - p.pts[0][1];
+    if (Math.hypot(dx * f.nw, dy * f.nh) < 2) {
+      toast("Source and target overlap — drag further away");
+      syncSpotOverlay();
+      return;
+    }
+  } else {
+    const plan = await planPaint(p);
+    if (!S.editor) return;            // photo changed while we were asking
+    if (plan) {
+      dx = plan.dx; dy = plan.dy;
+    } else {
+      // nothing usable found: fall back to the area beside what was painted,
+      // flipping sides when that would run off the frame
+      const step = 2.6 * p.r * short / f.nw;
+      const x = p.pts[0][0];
+      dx = x + step < 1 ? step : -step;
+      dy = 0;
+    }
+  }
+  const n = clone(curEdits());
+  n.spots = (n.spots || []).concat([{ pts: p.pts, r: p.r, dx, dy, mode: p.mode }]);
+  pushEdit(n);
+});
 
 // ---------------------------------------------------------------------------
 // Date split
@@ -1822,6 +2441,9 @@ document.addEventListener("keydown", (e) => {
       if (k === "escape") exitCropMode();
       return;
     }
+    // retouch keeps nav and zoom live (you zoom in to place a spot), so Esc
+    // leaves the mode first and only closes the viewer on a second press
+    if (S.spotMode && k === "escape") { exitRetouch(); return; }
     if (k === "escape") { closeViewer(); return; }
     // editor shortcuts (loupe only): O original/edited, C crop, I info, G grid, H histogram
     if (S.viewer.mode === "loupe" && S.editor) {
@@ -1830,6 +2452,7 @@ document.addEventListener("keydown", (e) => {
       if (k === "i") { toggleMeta(); return; }
       if (k === "g") { toggleGrid(); return; }
       if (k === "h") { toggleHist(); return; }
+      if (k === "p") { toggleRetouch(); return; }
     }
     if (S.viewer.mode === "tournament") {
       switch (k) {
@@ -1928,6 +2551,9 @@ async function runExport() {
         keep_structure: $("exStruct").checked,
         compress: $("exCompress").checked,
         quality: parseInt($("exQuality").value, 10),
+        raw_jpeg: $("exRawJpeg").checked,
+        raw_copy: $("exRawCopy").checked,
+        raw_sidecar: $("exRawSidecar").checked,
       }),
     });
     if (!resp.ok) {
@@ -2018,6 +2644,8 @@ function openExport() {
   $("exProgress").classList.add("hidden");
   $("exProgressBar").style.width = "0%";
   $("exProgressLabel").textContent = "";
+  // the RAW switches only mean anything if the library actually holds RAWs
+  $("exRawBox").classList.toggle("hidden", !S.photos.some((p) => RAW_EXTS.has(p.ext)));
   showModal("exportModal");
 }
 
@@ -2318,12 +2946,29 @@ $("groupRaw").addEventListener("change", (e) => {
 $("exportBtn").addEventListener("click", openExport);
 $("exCancel").addEventListener("click", () => hideModal("exportModal"));
 $("exRun").addEventListener("click", runExport);
+// ---- RAW export switches (persisted) ----
+(function initRawExport() {
+  for (const id of ["exRawJpeg", "exRawCopy", "exRawSidecar"]) {
+    const box = $(id);
+    const saved = localStorage.getItem(id);
+    if (saved !== null) box.checked = saved === "1";
+    box.addEventListener("change", () => {
+      localStorage.setItem(id, box.checked ? "1" : "0");
+      // asking the export for a JPEG off the negative is also a statement about
+      // what you want to be looking at while you edit it
+      if (id === "exRawJpeg" && box.checked) setPreviewSrc("raw");
+    });
+  }
+})();
+
 $("exCompress").addEventListener("change", (e) => {
   document.querySelector(".exq").classList.toggle("hidden", !e.target.checked);
 });
 
 // ---- editor ----
 $("editBar").addEventListener("click", (e) => {
+  const chg = e.target.closest(".hchg.togglable");
+  if (chg) { toggleEditKey(chg.dataset.key); return; }
   const head = e.target.closest(".ed-sec-head");
   if (head) { toggleSection(head.closest(".ed-section")); return; }
   const b = e.target.closest("button[data-act]");
@@ -2380,6 +3025,49 @@ $("borderWNum").addEventListener("change", () => {
 });
 $("borderC").addEventListener("input", borderInput);
 $("borderC").addEventListener("change", borderCommit);
+
+// ---- retouch controls: brush size / heal-vs-clone / crop ratio, all remembered
+// across sessions. None of them is part of the edit stack — they only decide
+// what the next click produces. ----
+(function initRetouchControls() {
+  const size = $("spotSize"), num = $("spotSizeNum"), mode = $("spotModeSel"),
+        tool = $("spotTool"), aspect = $("cropAspect");
+  const savedSize = parseFloat(localStorage.getItem("spotSize") || "");
+  if (savedSize >= +size.min && savedSize <= +size.max) size.value = savedSize;
+  num.value = Math.round(size.value * 1000) / 10;
+  const savedMode = localStorage.getItem("spotModeSel");
+  if (savedMode === "heal" || savedMode === "clone") mode.value = savedMode;
+  const savedAspect = localStorage.getItem("cropAspect");
+  if (savedAspect !== null && [...aspect.options].some((o) => o.value === savedAspect)) {
+    aspect.value = savedAspect;
+  }
+  size.addEventListener("input", () => {
+    num.value = Math.round(size.value * 1000) / 10;
+    localStorage.setItem("spotSize", size.value);
+    refreshSpotBrush();
+  });
+  num.addEventListener("change", () => {
+    let v = parseFloat(num.value);
+    if (isNaN(v)) v = 3;
+    v = Math.max(0.5, Math.min(15, v));
+    num.value = v;
+    size.value = v / 100;
+    localStorage.setItem("spotSize", size.value);
+    refreshSpotBrush();
+    num.blur();
+  });
+  const savedTool = localStorage.getItem("spotTool");
+  if (savedTool === "brush" || savedTool === "spot") tool.value = savedTool;
+  mode.addEventListener("change", () => localStorage.setItem("spotModeSel", mode.value));
+  tool.addEventListener("change", () => {
+    localStorage.setItem("spotTool", tool.value);
+    tool.blur();
+  });
+  aspect.addEventListener("change", () => {
+    localStorage.setItem("cropAspect", aspect.value);
+    aspect.blur();
+  });
+})();
 
 // ---- grid-view: paste edits to the compare selection, apply a preset ----
 $("pasteBtn").addEventListener("click", pasteEditsToSelection);
@@ -2455,13 +3143,12 @@ function fillTicks(datalistId, min, max, count) {
     inp.style.setProperty("--ticks", count - 1);
   });
 }
+// the tonal/lens sliders fill their own ticks in buildSliders(); these three
+// are hand-written in the markup because they have bespoke live handlers
 (function initTicks() {
-  fillTicks("ticksMid", 0.2, 2, 10);
-  fillTicks("ticksSat", 0, 2, 11);
-  fillTicks("ticksSharp", 0, 3, 13);
   fillTicks("ticksBorder", 0, 0.15, 16);
   fillTicks("ticksFine", -45, 45, 19);
-  fillTicks("ticksTemp", -1, 1, 11);
+  fillTicks("ticksSpot", 0.005, 0.15, 15);
 })();
 
 // ---- collapsible sidebar sections (click a header), persisted per-section ----
