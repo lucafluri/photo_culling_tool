@@ -67,6 +67,8 @@ def make_library():
     names = ["a.jpg", "b&'.jpg", "c.png", os.path.join("sub", "d.jpg")]
     for i, n in enumerate(names):
         Image.new("RGB", (300, 200), (40 * i % 255, 90, 160)).save(os.path.join(d, n))
+    # a stand-in negative beside a.jpg: never decoded by the tests, only routed
+    open(os.path.join(d, "a.cr2"), "wb").write(b"not really a raw")
     return d
 
 
@@ -79,11 +81,16 @@ def main():
 
     st, b = req("/api/open", {"folder": d, "recursive": True})
     photos = json.loads(b)["photos"]
-    check("open scans the folder recursively", st == 200 and len(photos) == 4, (st, b[:200]))
-    p0 = photos[0]["path"]
+    check("open scans the folder recursively", st == 200 and len(photos) == 5, (st, b[:200]))
+    p0 = next(p["path"] for p in photos if p["path"].endswith("a.jpg"))
 
     st, b = req(q("/api/thumb", path=p0))
     check("thumb renders a JPEG", st == 200 and b[:2] == b"\xff\xd8", st)
+
+    # RAW-source grid thumbs ask for full=1; on a non-RAW it must fall back
+    # instead of handing libraw a JPEG
+    st, b = req(q("/api/thumb", path=p0, full=1))
+    check("thumb full=1 falls back on a non-RAW", st == 200 and b[:2] == b"\xff\xd8", st)
 
     # A live editor preview is a fast draft off a downscaled base. It must not
     # be reused as the committed render for the same edits — that would leave a
@@ -100,12 +107,31 @@ def main():
 
     # export: structure kept, edits baked, nothing overwritten on a second run
     req("/api/mark", {"path": p0, "flag": 1})
-    req("/api/mark", {"path": photos[3]["path"], "flag": 1})
+    req("/api/mark", {"path": os.path.join(d, "sub", "d.jpg"), "flag": 1})
+    req("/api/mark", {"path": os.path.join(d, "a.cr2"), "flag": 1})
+    # the UI mirrors a group's edits onto every member, negative included —
+    # that must not be read as "render me a JPEG off this negative"
+    req("/api/edit", {"path": os.path.join(d, "a.cr2"), "edits": edits})
     out = os.path.join(WORK, "out")
-    body = {"dest": out, "action": "copy", "selection": "keep", "keep_structure": True}
+    # neither RAW switch on: the edited JPEG goes out, its negative doesn't
+    body = {"dest": out, "action": "copy", "selection": "keep", "keep_structure": True,
+            "raw_jpeg": False, "raw_copy": False}
     st, b = req("/api/export", body)
     done = json.loads([ln for ln in b.decode().splitlines() if '"done"' in ln][-1][5:])
     check("export streams progress and finishes", st == 200 and done["exported"] == 2, done)
+    check("both RAW switches off skips the negative",
+          not any(f.lower().endswith((".cr2", "_raw.jpg")) for f in os.listdir(out)),
+          os.listdir(out))
+    out2 = os.path.join(WORK, "out_raw")
+    st, b = req("/api/export", dict(body, dest=out2, raw_copy=True))
+    done2 = json.loads([ln for ln in b.decode().splitlines() if '"done"' in ln][-1][5:])
+    check("raw_copy on still exports the negative",
+          done2["exported"] == 3 and os.path.isfile(os.path.join(out2, "a.cr2")),
+          (done2["exported"], os.listdir(out2)))
+    check("an edited negative alone doesn't render a _raw.jpg",
+          not done2["errors"] and
+          not any(f.endswith("_raw.jpg") for f in os.listdir(out2)),
+          (done2["errors"], os.listdir(out2)))
     check("keep_structure preserves the subfolder",
           os.path.isfile(os.path.join(out, "sub", "d.jpg")), os.listdir(out))
     check("edited photo exports as a baked JPEG",
@@ -130,7 +156,7 @@ def main():
     paths = [p["path"] for p in json.loads(b)["photos"]]
     check("deleted file is pruned from the DB",
           not any(p.endswith("c.png") for p in paths), paths)
-    check("the other photos survive the prune", len(paths) == 3, paths)
+    check("the other photos survive the prune", len(paths) == 4, paths)
 
     st, b = req("/api/save-copy", {"path": p0})
     check("save copy writes an edited JPEG next to the original",

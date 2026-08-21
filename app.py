@@ -228,8 +228,8 @@ def _load_raw_full(path):
     smaller than the sensor and already cooked by the camera. When the point of
     the export is "give me the good version off the negative", decode properly.
     """
-    if not HAVE_RAWPY:
-        return _load_pil(path)
+    if not HAVE_RAWPY or Path(path).suffix.lower() not in RAW_EXTS:
+        return _load_pil(path)   # `full=1` asked for on a JPEG — nothing to demosaic
     with rawpy.imread(path) as raw:
         rgb = raw.postprocess(use_camera_wb=True, output_bps=8)
     img = Image.fromarray(rgb)
@@ -1276,6 +1276,7 @@ class ExportReq(BaseModel):
     quality: int = 85           # JPEG quality when compress is on
     # What to produce for a RAW file. Independent, so a shoot can go out as the
     # negative *and* a finished JPEG in one pass.
+    # Both off = skip RAW files entirely (export the edited JPEG siblings only).
     raw_jpeg: bool = False      # render a JPEG from a full RAW decode, edits baked
     raw_copy: bool = True       # copy/move the RAW file itself
     raw_sidecar: bool = False   # write an .xmp beside the copied RAW
@@ -1434,8 +1435,12 @@ def api_open(req: OpenReq):
 
 
 @app.get("/api/thumb")
-def api_thumb(path: str = Query(...)):
-    f = get_rendered(path, THUMB_SIZE, "thumb")
+def api_thumb(path: str = Query(...), full: int = Query(0)):
+    # `full=1` decodes the negative instead of lifting its embedded camera JPEG,
+    # so a RAW-mode grid shows the same rendering the loupe and the export do.
+    # It reuses the loupe's cached preview-size base, so the demosaic is paid
+    # once per file, not once per view.
+    f = get_rendered(path, THUMB_SIZE, "thumb", full=bool(full))
     return FileResponse(f, media_type="image/jpeg")
 
 
@@ -1771,6 +1776,16 @@ def api_export(req: ExportReq):
 
             src_ext = os.path.splitext(src)[1].lower()
             is_raw = src_ext in RAW_EXTS
+            if is_raw and not (req.raw_jpeg or req.raw_copy):
+                # Neither RAW switch on = "leave the negatives out of it". The
+                # JPEG sibling carries the same edits and is the only thing
+                # going out; a move leaves the RAW where it is rather than
+                # silently deleting it.
+                yield "data: " + json.dumps({
+                    "type": "progress", "done": done, "total": total,
+                    "name": name_display, "error": False
+                }) + "\n\n"
+                continue
             is_jpeg = src_ext in {".jpg", ".jpeg"}
             do_compress = req.compress and is_jpeg
             bake = bool(edits) and not is_raw
@@ -1800,17 +1815,18 @@ def api_export(req: ExportReq):
                 if is_raw:
                     # A RAW can be exported as a finished JPEG rendered off the
                     # negative, as the negative itself, or as both — the three
-                    # switches are independent. `raw_jpeg` off but the RAW
-                    # carrying its own edits still renders, which is what this
-                    # did before the switches existed.
+                    # switches are independent and they are the whole story.
+                    # Edits alone never conjure a JPEG: the edits live on every
+                    # member of the group, so that would put a <stem>_raw.jpg
+                    # beside every edited JPEG whether or not it was asked for.
                     grp = group_edits.get(_base_key(src))
                     if grp:
                         try:
                             grp = applied_edits(json.loads(grp))
                         except (TypeError, ValueError):
                             grp = None
-                    want_jpeg = req.raw_jpeg or bool(edits)
-                    want_copy = req.raw_copy or not want_jpeg   # never produce nothing
+                    want_jpeg = req.raw_jpeg
+                    want_copy = req.raw_copy
                     if want_jpeg:
                         suffix = "_raw" if _base_key(src) in raw_siblings else ""
                         target = free_target(stem + suffix + ".jpg")

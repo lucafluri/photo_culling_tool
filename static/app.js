@@ -68,7 +68,15 @@ function verSuffix(path) {
   const x = S.byPath.get(path);
   return x && x._ev ? "&v=" + x._ev : "";
 }
-const thumbUrl = (p) => "/api/thumb?path=" + encodeURIComponent(p) + verSuffix(p);
+// In RAW mode the thumbnail decodes the negative too (`full`): the embedded
+// preview is a camera JPEG, so without this the grid keeps showing the film
+// simulation while the loupe shows the libraw render. Cost is one demosaic per
+// file — the preview-size base is cached on disk and shared with the loupe.
+const thumbUrl = (p) => {
+  const raw = rawRenderPath(S.byPath.get(p));
+  const t = raw || p;
+  return "/api/thumb?path=" + encodeURIComponent(t) + (raw ? "&full=1" : "") + verSuffix(t);
+};
 // The RAW file behind a photo, if it has one — either its own path or the
 // negative sitting beside the JPEG it is grouped with.
 function rawMemberPath(p) {
@@ -80,13 +88,13 @@ function rawMemberPath(p) {
   }) || null;
 }
 
-// Which file the loupe should actually render, or null for "the photo itself".
-// Previewing the camera JPEG shows the camera's film simulation and tone curve;
-// an export rendered from the negative goes through libraw and looks different,
-// so the two are a deliberate choice rather than an accident.
+// Which file we should actually render for a photo, or null for "the photo
+// itself". Previewing the camera JPEG shows the camera's film simulation and
+// tone curve; an export rendered from the negative goes through libraw and looks
+// different, so the two are a deliberate choice rather than an accident — and
+// the choice holds everywhere the photo is drawn, grid and panes included.
 function rawRenderPath(p) {
   if (S.previewSrc !== "raw") return null;
-  if (S.viewer && S.viewer.mode !== "loupe") return null;
   return rawMemberPath(p);
 }
 
@@ -97,6 +105,7 @@ function setPreviewSrc(which) {
   syncSourceRow();
   if (S.editor) renderEditPreview();
   if (S.showMeta) renderMeta();
+  refreshThumbs();
 }
 
 // the switch only means anything for a photo that has a negative behind it
@@ -108,8 +117,6 @@ function syncSourceRow() {
   $("srcJpegBtn").classList.toggle("active", S.previewSrc !== "raw");
   $("srcRawBtn").classList.toggle("active", S.previewSrc === "raw");
 }
-// the file the editor is currently rendering for `path` (its RAW twin, or itself)
-const renderPathFor = (path) => rawRenderPath(S.byPath.get(path)) || path;
 
 // Pass `editsObj` to render a live editor preview of those exact edits; omit it
 // to show the photo's stored edits.
@@ -774,7 +781,7 @@ function buildPanes() {
       computeFit(idx, pane, img); applyTransform(); drawHistogram();
     };
     img.onerror = () => { if (idx === 0) paneBusy(null); };
-    if (idx === 0 && S.viewer.mode === "loupe") paneBusy(busyLabelFor(path));
+    if (idx === 0) paneBusy(busyLabelFor(path));
     img.src = previewUrl(path);
     const label = document.createElement("div");
     label.className = "plabel";
@@ -1420,10 +1427,20 @@ function editTargets(p) {
 function refreshThumb(p) {
   const vi = S.view.indexOf(p);
   if (vi < 0) return;
-  const img = grid.querySelector(`.cell[data-i="${vi}"] img`);
-  if (!img) return;
-  if (img.src) img.src = thumbUrl(p.path);
-  else img.dataset.src = thumbUrl(p.path);   // not lazily loaded yet
+  setThumbSrc(grid.querySelector(`.cell[data-i="${vi}"] img`), p);
+}
+
+// same, for every visible cell — the JPEG/RAW switch repoints all of them
+function refreshThumbs() {
+  grid.querySelectorAll(".cell img").forEach((img) =>
+    setThumbSrc(img, S.view[+img.parentElement.dataset.i]));
+}
+
+function setThumbSrc(img, p) {
+  if (!img || !p) return;
+  const u = thumbUrl(p.path);
+  if (img.src) img.src = u;
+  else img.dataset.src = u;   // not lazily loaded yet
 }
 
 // server render of the edits dict into the pane. Live CSS layers (filter,
