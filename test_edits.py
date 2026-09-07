@@ -5,10 +5,12 @@ import math
 import os
 import tempfile
 import xml.dom.minidom
+from datetime import datetime
 
+import numpy as np
 from PIL import Image, ImageDraw
 from app import (_apply_edits, _bake_to_jpeg, _edits_tag, _find_paint_offset,
-                 _tone_lut, _write_xmp_sidecar, applied_edits)
+                 _tone_lut, _write_xmp_sidecar, applied_edits, capture_time)
 
 
 def test_apply_edits():
@@ -276,6 +278,10 @@ def test_applied_edits():
     assert applied_edits({}) is None
     assert applied_edits({"off": {"exposure": 1}}) is None       # nothing live left
     assert applied_edits({"bw": True, "off": {"exposure": 1}}) == {"bw": True}
+    # an adjustment that is present but empty changes no pixels either — the
+    # last spot removed, a hand-written preset with a null crop
+    assert applied_edits({"spots": [], "crop": None, "bw": False}) is None
+    assert applied_edits({"spots": [], "bw": True}) == {"bw": True}
 
     grey = Image.new("RGB", (8, 8), (100, 100, 100))
     parked = {"off": {"exposure": 2, "bw": True}}
@@ -305,6 +311,85 @@ def test_xmp_sidecar():
         assert json.loads(desc.getAttribute("culler:Edits")) == {"exposure": 0.7, "bw": True}
 
 
+def _jpeg_with_exif(path):
+    img = Image.new("RGB", (240, 160), (90, 120, 160))
+    exif = img.getexif()
+    exif[271] = "Nikon"
+    exif[272] = "Z 8"
+    exif[0x0112] = 6                     # Orientation: rotate 90° CW on display
+    exif.get_ifd(0x8769)[36867] = "2024:05:01 11:22:33"
+    img.save(path, "JPEG", quality=92, exif=exif.tobytes())
+    return path
+
+
+def test_bake_keeps_exif():
+    # Half the stack builds its result with numpy or expands the frame, and
+    # those paths hand back a PIL image with an empty `info`. Reading the EXIF
+    # off *that* silently dropped the camera and the capture date from every
+    # export with a vignette, a border or a colour move on it.
+    with tempfile.TemporaryDirectory() as d:
+        src = _jpeg_with_exif(os.path.join(d, "in.jpg"))
+        for name, edits in (("vibrance", {"vibrance": 0.5}),
+                            ("grain", {"grain": 0.3}),
+                            ("border", {"border": {"w": 0.05, "color": "#fff"}}),
+                            ("crop", {"crop": [0.1, 0.1, 0.9, 0.9]})):
+            out = os.path.join(d, name + ".jpg")
+            _bake_to_jpeg(src, out, edits, 90)
+            with Image.open(out) as im:
+                ex = im.getexif()
+                assert ex.get(272) == "Z 8", name
+                assert ex.get_ifd(0x8769).get(36867) == "2024:05:01 11:22:33", name
+                # the pixels are already the right way up; leaving the tag in
+                # would have every viewer rotate them a second time
+                assert ex.get(0x0112) is None, name
+
+
+def test_capture_time():
+    with tempfile.TemporaryDirectory() as d:
+        src = _jpeg_with_exif(os.path.join(d, "in.jpg"))
+        # EXIF timestamps carry no zone, so the app reads them as local time;
+        # the expected value has to be built the same way
+        want = datetime.strptime("2024:05:01 11:22:33", "%Y:%m:%d %H:%M:%S").timestamp()
+        assert capture_time(src, ".jpg") == want
+
+        # a RAW that isn't a TIFF container (CR3 and friends) is skipped on the
+        # magic number rather than handed to a decoder once per scan
+        stub = os.path.join(d, "DSC_0001.cr3")
+        open(stub, "wb").write(b"\x00\x00\x00\x18ftypcrx ")
+        assert capture_time(stub, ".cr3") is None
+
+        # ...but a TIFF-shaped RAW gets read like any other TIFF, which is what
+        # lets a RAW-only shoot sort and date-split by capture time
+        tiff = os.path.join(d, "DSC_0002.dng")
+        img = Image.new("RGB", (16, 16), "grey")
+        ex = img.getexif()
+        ex.get_ifd(0x8769)[36867] = "2023:11:02 08:00:00"
+        img.save(tiff, "TIFF", exif=ex.tobytes())
+        want = datetime.strptime("2023:11:02 08:00:00", "%Y:%m:%d %H:%M:%S").timestamp()
+        assert capture_time(tiff, ".dng") == want
+
+
+def test_grain_is_the_same_size_at_any_resolution():
+    # Grain used to be generated per output pixel, so the 2400px preview showed
+    # grain several times coarser than the file the export actually wrote.
+    # It is now sized against the frame: viewed at one size, two renders of the
+    # same photo have to be about equally grainy.
+    def graininess(long_edge):
+        w = long_edge
+        h = int(long_edge * 2 / 3)
+        flat = Image.new("RGB", (w, h), (128, 128, 128))
+        out = _apply_edits(flat, {"grain": 0.5})
+        seen = out.convert("L").resize((600, 400), Image.LANCZOS)
+        return float(np.asarray(seen, np.float32).std())
+
+    big, small = graininess(4800), graininess(1600)
+    assert 0.6 < big / small < 1.6, (big, small)
+    # and it is still deterministic, or every cache miss would be a new picture
+    flat = Image.new("RGB", (900, 600), (128, 128, 128))
+    assert (_apply_edits(flat, {"grain": 0.4}).tobytes() ==
+            _apply_edits(flat, {"grain": 0.4}).tobytes())
+
+
 def test_bake_to_jpeg():
     # export bakes the same transforms into a real JPEG on disk
     with tempfile.TemporaryDirectory() as d:
@@ -329,6 +414,9 @@ if __name__ == "__main__":
     test_retouch_entry_shapes()
     test_full_stack_no_mutation()
     test_grain_is_deterministic()
+    test_grain_is_the_same_size_at_any_resolution()
+    test_bake_keeps_exif()
+    test_capture_time()
     test_applied_edits()
     test_xmp_sidecar()
     test_bake_to_jpeg()

@@ -56,6 +56,17 @@ button.active { background: var(--accent); border-color: var(--accent); color: #
   padding: 4px 9px;
 }
 .gridsize input[type=range] { width: 70px; accent-color: var(--accent); cursor: pointer; }
+.searchbox {
+  display: flex; align-items: center; gap: 5px; color: var(--muted);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  padding: 0 8px;
+}
+.searchbox:focus-within { border-color: var(--accent); }
+.searchbox input {
+  width: 96px; background: none; border: none; color: var(--txt);
+  font: inherit; padding: 4px 0; outline: none;
+}
+.searchbox input::-webkit-search-cancel-button { filter: invert(0.7); }
 .counts { color: var(--muted); margin-right: 6px; white-space: nowrap; }
 .counts b { color: var(--txt); }
 
@@ -126,6 +137,9 @@ button.active { background: var(--accent); border-color: var(--accent); color: #
   cursor: pointer;
 }
 .cell img { width: 100%; height: 100%; object-fit: contain; display: block; }
+/* "fill" crops each thumbnail to the cell instead of letterboxing it — denser
+   on a mixed-orientation shoot, at the cost of not seeing the whole frame */
+body.fillthumbs .cell img { object-fit: cover; }
 .cell.sel { border-color: var(--accent); }
 .cell.hover { border-color: var(--accent); border-style: dashed; }
 body.mousemode .cell { cursor: crosshair; }
@@ -211,7 +225,9 @@ body.mousemode .cell { cursor: crosshair; }
 .pflag.reject { background: var(--reject); color: #2a0808; }
 /* ---- editor ---- */
 .cell .editbadge {
-  position: absolute; bottom: 4px; left: 4px; z-index: 2; font-size: 11px;
+  /* clear of the flag dot, which sits at left:5px and is 14px wide — the two
+     were drawn on top of each other, so an edited keeper showed neither */
+  position: absolute; bottom: 3px; left: 24px; z-index: 2; font-size: 11px;
   color: var(--star); text-shadow: 0 1px 2px #000; pointer-events: none;
 }
 /* ---- edit sidebar (Lightroom-style docked panel, loupe only) ---- */
@@ -268,8 +284,8 @@ body.mousemode .cell { cursor: crosshair; }
 }
 .ed-hint { color: var(--muted); font-size: 11px; text-align: center; padding-top: 2px; }
 
-#presetGridSel { max-width: 110px; }
-#typeSel { max-width: 90px; }
+#presetGridSel { max-width: 96px; }
+#typeSel { max-width: 120px; }
 #filterSel { max-width: 100px; }
 #sortSel { max-width: 110px; }
 
@@ -403,9 +419,60 @@ polyline.spotpainting { fill: none; }
 .hud {
   padding: 6px 12px; background: #111; border-top: 1px solid var(--line);
   color: var(--muted); display: flex; justify-content: space-between;
-  font-size: 12px;
+  align-items: center; gap: 12px; font-size: 12px;
 }
 .hud .stars { color: var(--star); }
+.hud .hudright { display: flex; align-items: center; gap: 8px; }
+.hud .hudright button {
+  padding: 2px 8px; font-size: 11px; line-height: 1.5;
+  background: var(--panel); color: var(--muted);
+}
+.hud .hudright button:hover { color: var(--txt); }
+.hud .hudright button.active { background: var(--accent); color: #06121f; font-weight: 600; }
+
+/* ---- loupe prev/next: big invisible hit areas at the edges of the pane that
+   only show their chevron on hover, so the picture is never fighting a pair of
+   permanent arrows for attention ---- */
+.loupenav {
+  position: absolute; top: 0; bottom: 0; width: 74px; z-index: 5;
+  display: flex; align-items: center; justify-content: center;
+  border: none; border-radius: 0; padding: 0; background: none;
+  color: #fff; font-size: 34px; line-height: 1; opacity: 0;
+  transition: opacity .12s, background .12s; text-shadow: 0 1px 6px #000;
+}
+.loupenav.prev { left: 0; }
+.loupenav.next { right: 0; }
+#editBar:not(.hidden):not(.collapsed-full) ~ .loupenav.next { right: 300px; }
+.loupenav:hover { opacity: 1; background: linear-gradient(90deg, #0007, #0000); }
+.loupenav.next:hover { background: linear-gradient(270deg, #0007, #0000); }
+.loupenav:disabled { opacity: 0 !important; pointer-events: none; }
+
+/* ---- filmstrip: where you are in the shoot, and a way to jump with the mouse
+   without going back to the grid ---- */
+.filmstrip {
+  display: flex; gap: 4px; padding: 5px 6px; background: #101010;
+  border-top: 1px solid var(--line); overflow-x: auto; overflow-y: hidden;
+  flex-shrink: 0; scrollbar-width: thin;
+}
+.filmstrip .fs-cell {
+  position: relative; flex: 0 0 auto; width: 84px; height: 60px;
+  border: 2px solid transparent; border-radius: 4px; overflow: hidden;
+  background: var(--bg2); cursor: pointer;
+}
+.filmstrip .fs-cell img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.filmstrip .fs-cell.cur { border-color: var(--accent); }
+.filmstrip .fs-cell.cmp { box-shadow: inset 0 0 0 2px var(--star); }
+.filmstrip .fs-cell .fs-flag {
+  position: absolute; top: 3px; left: 3px; width: 9px; height: 9px;
+  border-radius: 50%; box-shadow: 0 1px 2px #000; display: none;
+}
+.filmstrip .fs-cell.flag-keep .fs-flag { display: block; background: var(--keep); }
+.filmstrip .fs-cell.flag-reject .fs-flag { display: block; background: var(--reject); }
+.filmstrip .fs-cell.flag-reject img { opacity: .45; }
+.filmstrip .fs-cell .fs-stars {
+  position: absolute; bottom: 1px; right: 3px; color: var(--star);
+  font-size: 9px; text-shadow: 0 1px 2px #000;
+}
 
 /* ---- modals ---- */
 .modal {
@@ -415,6 +482,9 @@ polyline.spotpainting { fill: none; }
 .modal-box {
   background: var(--bg2); border: 1px solid var(--line); border-radius: 10px;
   padding: 20px 24px; max-width: 720px; width: 90%;
+  /* the shortcut sheet is ~2000px tall; without this its Close button sat off
+     the bottom of the screen with no way to reach it */
+  max-height: 92vh; overflow-y: auto;
 }
 .modal-box.wide { max-width: 1000px; }
 .modal-box h2 { margin: 0 0 14px; }
@@ -507,9 +577,12 @@ kbd {
 }
 
 .toast {
-  position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+  position: fixed; bottom: 18px; left: 50%; z-index: 90;
   background: #000c; border: 1px solid var(--line); color: var(--txt);
-  padding: 8px 16px; border-radius: 8px; z-index: 90; transition: opacity .2s;
+  padding: 8px 16px; border-radius: 8px; pointer-events: none;
+  opacity: 0; transform: translateX(-50%) translateY(6px);
+  transition: opacity .18s ease, transform .18s ease;
 }
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 .hidden { display: none !important; }
 .empty { color: var(--muted); padding: 40px; text-align: center; grid-column: 1 / -1; }

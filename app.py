@@ -196,11 +196,23 @@ def _load_pil(path):
 def capture_time(path, ext):
     """Best-effort EXIF capture time (epoch seconds), or None.
 
-    RAW formats aren't reliably readable via Pillow, so we skip them and let the
-    caller fall back to file mtime.
+    Most camera RAWs are TIFF containers, so Pillow can read their IFDs even
+    though it cannot decode the sensor data — which is why RAWs are tried here
+    rather than skipped, and why a RAW-only shoot can finally sort and date-split
+    by capture time instead of falling back to file mtime.
+
+    A RAW is only opened when its first bytes say TIFF. Not for correctness (the
+    try below would catch a failure anyway) but for speed: the ISO-BMFF formats
+    — CR3 above all — would otherwise go to the HEIF opener, which parses a lot
+    more of the file than a header read, once per photo per scan.
     """
     if ext in RAW_EXTS:
-        return None
+        try:
+            with open(path, "rb") as fh:
+                if fh.read(4) not in (b"II*\x00", b"MM\x00*"):
+                    return None
+        except OSError:
+            return None
     try:
         with Image.open(path) as img:
             exif = img.getexif()
@@ -230,8 +242,18 @@ def _load_raw_full(path):
     """
     if not HAVE_RAWPY or Path(path).suffix.lower() not in RAW_EXTS:
         return _load_pil(path)   # `full=1` asked for on a JPEG — nothing to demosaic
-    with rawpy.imread(path) as raw:
-        rgb = raw.postprocess(use_camera_wb=True, output_bps=8)
+    try:
+        with rawpy.imread(path) as raw:
+            rgb = raw.postprocess(use_camera_wb=True, output_bps=8)
+    except Exception as e:  # noqa — libraw raises its own family of errors
+        # A truncated file, or a RAW variant this libraw build doesn't know.
+        # Falling back to the embedded preview would be worse than failing: the
+        # loupe's whole reason for a RAW mode is that it shows what an export
+        # off the negative will look like, and an export would silently write
+        # the camera JPEG at preview size. Say what happened instead.
+        raise HTTPException(
+            status_code=422,
+            detail="could not decode {}: {}".format(os.path.basename(path), e))
     img = Image.fromarray(rgb)
     return img if img.mode == "RGB" else img.convert("RGB")
 
@@ -255,20 +277,47 @@ def _compress_jpeg(src, target, quality):
         im.save(target, "JPEG", **kw)
 
 
+def _source_metadata(path):
+    """(EXIF bytes with the orientation tag cleared, ICC profile) for `path`.
+
+    Read off the file rather than off the edited image: half the edit stack
+    (anything that goes through numpy, merges channels, or expands the frame)
+    returns a brand-new PIL image with an empty `info`, so a photo exported with
+    a vignette or a border used to lose its camera, lens and capture date while
+    a cropped one kept them. Orientation goes because the pixels are already
+    rotated — leaving it would make viewers rotate them a second time.
+
+    Anything unreadable (a CR3, a corrupt file) comes back as (None, None) and
+    the export simply carries no metadata, which is what it did before.
+    """
+    try:
+        with Image.open(path) as im:
+            icc = im.info.get("icc_profile")
+            exif = im.getexif()
+            if not exif:
+                return None, icc
+            exif.pop(0x0112, None)
+            # tobytes() walks the sub-IFDs, so it has to run while the file is
+            # still open — that is why this isn't split into two helpers
+            return exif.tobytes(), icc
+    except Exception:
+        return None, None
+
+
 def _bake_to_jpeg(src, target, edits, quality, raw_full=False):
     """Render `src` with `edits` baked in and write a JPEG to `target`.
 
     Pixels are oriented and edited (rotate/flip/crop/tone applied); EXIF is
-    carried over with the orientation tag cleared so viewers don't re-rotate an
-    already-rotated image. Used by export so the exported file matches the
-    edited preview.
+    carried over from the source with the orientation tag cleared so viewers
+    don't re-rotate an already-rotated image. Used by export so the exported
+    file matches the edited preview.
     """
+    exif_bytes, icc = _source_metadata(src)
     img = _load_raw_full(src) if raw_full else _load_pil(src)
     img = _apply_edits(img, edits)
-    exif = img.getexif()
-    exif.pop(0x0112, None)          # Orientation — already baked into the pixels
-    kw = {"quality": quality, "optimize": True, "exif": exif.tobytes()}
-    icc = img.info.get("icc_profile")
+    kw = {"quality": quality, "optimize": True}
+    if exif_bytes:
+        kw["exif"] = exif_bytes
     if icc:
         kw["icc_profile"] = icc
     img.save(target, "JPEG", **kw)
@@ -448,19 +497,40 @@ def _vignette(img, amt):
     return _by_strips(img, band)
 
 
-def _grain(img, amt):
-    """Monochrome gaussian grain.
+GRAIN_REF = 1600      # long edge the grain cell size is defined against
 
-    Seeded from the band's position, so the same edits always render the same
-    bytes — an unseeded rng would make every cache render a different picture.
+
+def _grain(img, amt):
+    """Monochrome gaussian grain, at the same visual size in any render.
+
+    The grain is generated on a grid whose long edge is always GRAIN_REF and
+    then scaled up to the frame, so one grain cell covers the same *fraction*
+    of the picture at 2400px preview and at 45MP export. Generating it per
+    output pixel instead — which is what this used to do — made the preview's
+    grain look several times coarser than the file the export actually wrote.
+
+    The field is carried as an 8-bit plane (offset by 128) rather than float32
+    so a 45MP export costs 45 MB here instead of 180 MB; up to `_render_sem` of
+    these run at once. Seeded, because renders are cached by a hash of the
+    edits: an unseeded rng would make every cache miss a different picture.
     """
+    W, H = img.size
+    scale = max(1.0, max(W, H) / float(GRAIN_REF))
+    nw, nh = max(1, int(round(W / scale))), max(1, int(round(H / scale)))
+    # bilinear upscaling averages neighbours, which costs a flat ~1/3 of the
+    # amplitude whatever the scale factor is; 1.5 puts that back so the strength
+    # a given `grain` value produces is the one it always produced
+    sigma = 26.0 * 1.5 * amt
+    field = np.random.default_rng(9781).normal(128.0, sigma, (nh, nw))
+    plane = Image.fromarray(np.clip(field, 0, 255).astype(np.uint8), "L")
+    if (nw, nh) != (W, H):
+        plane = plane.resize((W, H), Image.BILINEAR)
+
     def band(sub, y0, _h):
-        w, h = sub.size
-        noise = np.random.default_rng(9781 + y0).normal(0.0, 26.0 * amt, (h, w, 1))
-        arr = np.asarray(sub, np.float32) + noise.astype(np.float32)
+        h = sub.size[1]
+        n = np.asarray(plane.crop((0, y0, W, y0 + h)), np.float32) - 128.0
+        arr = np.asarray(sub, np.float32) + n[..., None]
         return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
-    # ponytail: grain is sized in output pixels, so a thumbnail shows coarser
-    # grain than the export. Scale by long edge if that ever matters.
     return _by_strips(img, band)
 
 
@@ -896,7 +966,12 @@ def applied_edits(edits):
     """
     if not edits:
         return None
-    live = {k: v for k, v in edits.items() if k != "off"}
+    # An adjustment that is present but empty — `spots: []` after the last spot
+    # was removed, `crop: null` off a hand-written preset — changes no pixels
+    # either, and leaving it in would light the ✎ badge and give the photo its
+    # own cache key for a render identical to the original.
+    live = {k: v for k, v in edits.items()
+            if k != "off" and v is not None and v is not False and v != [] and v != {}}
     return live or None
 
 
@@ -948,15 +1023,23 @@ def _save_cache_jpeg(img, out, **kw):
 # adds a render per slider release and, now, a preview-size decode per RAW, so
 # the cache is also checked every so often while the app is up.
 _renders_since_prune = 0
+_prune_lock = threading.Lock()
 PRUNE_EVERY = 150
 
 
 def _note_render():
+    """Count a render and kick off a prune every PRUNE_EVERY of them.
+
+    Renders land from a thread pool, so the counter needs the lock — without it
+    two threads can both read 149, both write 150, and the prune never fires.
+    """
     global _renders_since_prune
-    _renders_since_prune += 1
-    if _renders_since_prune >= PRUNE_EVERY:
+    with _prune_lock:
+        _renders_since_prune += 1
+        if _renders_since_prune < PRUNE_EVERY:
+            return
         _renders_since_prune = 0
-        threading.Thread(target=prune_cache, daemon=True).start()
+    threading.Thread(target=prune_cache, daemon=True).start()
 
 
 def prune_cache(budget=CACHE_BUDGET):
@@ -1162,6 +1245,26 @@ def scan_folder(folder, recursive):
     return list_photos(found)
 
 
+def require_known(path):
+    """The library's own spelling of `path`, or 404.
+
+    The server binds to localhost, but any page the browser visits can still
+    issue GETs at it — and without this `/api/thumb?path=…` is a read primitive
+    for the whole filesystem, one JPEG-shaped file at a time. Every path the UI
+    asks about came out of the DB, so requiring the row costs one indexed lookup
+    and closes that off; a stale path (file deleted behind the app's back) now
+    reports "not in the library" instead of half-rendering.
+    """
+    with db() as conn:
+        row = conn.execute(
+            "SELECT path FROM photos WHERE path=? OR path=?",
+            (path, os.path.abspath(path)),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="not in the library")
+    return row["path"]
+
+
 def current_folder(required=True):
     """The open scan folder as an absolute path, or None if there isn't one.
 
@@ -1229,7 +1332,11 @@ class OpenReq(BaseModel):
 
 
 class MarkReq(BaseModel):
-    path: str
+    # one of `path` or `paths` — `paths` marks a whole selection in one
+    # transaction instead of one round trip per photo, which is the difference
+    # between instant and visibly slow when 200 frames are selected
+    path: Optional[str] = None
+    paths: Optional[List[str]] = None
     flag: Optional[int] = None     # 1 keep, -1 reject, 0 none
     rating: Optional[int] = None   # 0..5
 
@@ -1269,8 +1376,9 @@ class SplitReq(BaseModel):
 class ExportReq(BaseModel):
     dest: str
     action: str = "copy"        # "copy" | "move"
-    selection: str = "keep"     # "keep" | "reject" | "rated"
+    selection: str = "keep"     # "keep" | "reject" | "rated" | "selected"
     min_rating: int = 1         # used when selection == "rated"
+    paths: Optional[List[str]] = None   # used when selection == "selected"
     keep_structure: bool = False
     compress: bool = False      # re-encode JPEGs to shrink them
     quality: int = 85           # JPEG quality when compress is on
@@ -1440,7 +1548,7 @@ def api_thumb(path: str = Query(...), full: int = Query(0)):
     # so a RAW-mode grid shows the same rendering the loupe and the export do.
     # It reuses the loupe's cached preview-size base, so the demosaic is paid
     # once per file, not once per view.
-    f = get_rendered(path, THUMB_SIZE, "thumb", full=bool(full))
+    f = get_rendered(require_known(path), THUMB_SIZE, "thumb", full=bool(full))
     return FileResponse(f, media_type="image/jpeg")
 
 
@@ -1450,6 +1558,7 @@ def api_preview(path: str = Query(...), edits: Optional[str] = Query(None),
     # `edits` (JSON) overrides stored edits for live editor previews; absent =
     # use the photo's stored edits. `full=1` decodes a RAW properly instead of
     # using its embedded preview, so the loupe matches the RAW export.
+    path = require_known(path)
     if edits is not None:
         try:
             e = json.loads(edits)
@@ -1482,6 +1591,7 @@ def api_meta(path: str = Query(...), full: int = Query(0)):
     Anything unreadable is simply null — RAW support depends on how much of the
     TIFF container Pillow can parse.
     """
+    path = require_known(path)
     try:
         st = os.stat(path)
     except OSError:
@@ -1550,13 +1660,14 @@ def api_plan_paint(req: PaintReq):
     from one patch while the export healed from another would be a bug you only
     notice after the file is written.
     """
+    path = require_known(req.path)
     try:
-        st = os.stat(req.path)
+        st = os.stat(path)
     except OSError:
         raise HTTPException(status_code=404, detail="file not found")
     edits = dict(req.edits or {})
     edits.pop("border", None)      # the client hides the border while retouching
-    img = _apply_edits(_preview_base(req.path, st.st_mtime, req.full), edits)
+    img = _apply_edits(_preview_base(path, st.st_mtime, req.full), edits)
     W, H = img.size
     pts = [(float(p[0]) * W, float(p[1]) * H) for p in req.pts if len(p) >= 2]
     r = max(2, int(round(float(req.r) * min(W, H))))
@@ -1679,6 +1790,9 @@ def api_split(req: SplitReq):
 
 @app.post("/api/mark")
 def api_mark(req: MarkReq):
+    paths = list(req.paths) if req.paths else ([req.path] if req.path else [])
+    if not paths:
+        raise HTTPException(status_code=400, detail="no path given")
     sets = []
     vals = []
     if req.flag is not None:
@@ -1688,19 +1802,26 @@ def api_mark(req: MarkReq):
         sets.append("rating=?")
         vals.append(max(0, min(5, int(req.rating))))
     if not sets:
-        return {"ok": True}
-    vals.append(req.path)
+        return {"ok": True, "marked": 0, "photos": []}
+
+    stmt = "UPDATE photos SET {} WHERE path=?".format(", ".join(sets))
+    marked = 0
     with _db_lock, db() as conn:
-        cur = conn.execute(
-            "UPDATE photos SET {} WHERE path=?".format(", ".join(sets)), vals
-        )
-        if cur.rowcount == 0:
-            raise HTTPException(status_code=404, detail="unknown path")
+        for p in paths:
+            marked += conn.execute(stmt, vals + [p]).rowcount
+    if not marked:
+        raise HTTPException(status_code=404, detail="unknown path")
+    rows = []
     with db() as conn:
-        row = conn.execute(
-            "SELECT path, flag, rating FROM photos WHERE path=?", (req.path,)
-        ).fetchone()
-    return dict(row)
+        for i in range(0, len(paths), 500):   # SQLite caps bound variables
+            chunk = paths[i:i + 500]
+            rows += [dict(r) for r in conn.execute(
+                "SELECT path, flag, rating FROM photos WHERE path IN ({})".format(
+                    ",".join("?" * len(chunk))), chunk)]
+    # single-path callers still get the flat row they always got
+    if req.paths is None:
+        return rows[0]
+    return {"ok": True, "marked": marked, "photos": rows}
 
 
 @app.post("/api/export")
@@ -1727,6 +1848,19 @@ def api_export(req: ExportReq):
             rows = conn.execute(
                 "SELECT * FROM photos WHERE rating>=? AND folder=?",
                 (int(req.min_rating), folder)).fetchall()
+        elif req.selection == "selected":
+            # An explicit list, for "export exactly what I picked in the grid".
+            # Still scoped to the open folder, like every other selection, so a
+            # stale list from a previous folder can't reach outside it.
+            wanted = [p for p in (req.paths or [])]
+            if not wanted:
+                raise HTTPException(status_code=400, detail="nothing selected")
+            rows = []
+            for i in range(0, len(wanted), 500):
+                chunk = wanted[i:i + 500]
+                rows += conn.execute(
+                    "SELECT * FROM photos WHERE folder=? AND path IN ({})".format(
+                        ",".join("?" * len(chunk))), [folder] + chunk).fetchall()
         else:
             raise HTTPException(status_code=400, detail="bad selection")
 

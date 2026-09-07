@@ -162,6 +162,45 @@ def main():
     check("save copy writes an edited JPEG next to the original",
           st == 200 and os.path.isfile(json.loads(b)["photo"]["path"]), (st, b[:200]))
 
+    # The render endpoints take a filesystem path, and any page the browser
+    # visits can point an <img> at them. Only files in the library may be read.
+    outsider = os.path.join(WORK, "outsider.jpg")
+    Image.new("RGB", (40, 40), "red").save(outsider)
+    st, _ = req(q("/api/thumb", path=outsider))
+    check("thumb refuses a path outside the library", st == 404, st)
+    st, _ = req(q("/api/preview", path=outsider))
+    check("preview refuses a path outside the library", st == 404, st)
+    st, _ = req(q("/api/meta", path=outsider))
+    check("meta refuses a path outside the library", st == 404, st)
+
+    # a file that libraw can't read must report itself, not 500. (The stand-in
+    # negative in this library is a text file, which is exactly that case.)
+    st, b = req(q("/api/preview", path=os.path.join(d, "a.cr2"), full=1))
+    check("an undecodable negative reports 422, not a crash",
+          st == 422 and b"could not decode" in b, (st, b[:160]))
+
+    # one request marks a whole selection, and reports what it touched
+    sel = [p for p in paths if p.endswith((".jpg", ".cr2"))][:3]
+    st, b = req("/api/mark", {"paths": sel, "rating": 4})
+    body = json.loads(b)
+    check("bulk mark updates every path in one call",
+          st == 200 and body["marked"] == len(sel) and
+          all(r["rating"] == 4 for r in body["photos"]), (st, b[:200]))
+
+    # "export what I picked in the grid" — an explicit list, still fenced to
+    # the open folder so a stale selection can't reach outside it
+    out3 = os.path.join(WORK, "out_sel")
+    st, b = req("/api/export", {"dest": out3, "action": "copy", "selection": "selected",
+                                "paths": sel[:2], "raw_copy": True})
+    done3 = json.loads([ln for ln in b.decode().splitlines() if '"done"' in ln][-1][5:])
+    check("export of an explicit selection takes only those files",
+          st == 200 and done3["exported"] == 2, (st, done3))
+    st, _ = req("/api/export", {"dest": out3, "selection": "selected",
+                                "paths": [outsider]})
+    check("export of a selection outside the folder exports nothing",
+          st == 200, st)
+    check("...and wrote no extra files", len(os.listdir(out3)) == 2, os.listdir(out3))
+
     server.should_exit = True
     time.sleep(0.4)
 

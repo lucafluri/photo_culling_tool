@@ -47,6 +47,11 @@ ORF and others) and HEIC/HEIF. Subfolders are optional. RAW decoding uses the
 embedded preview, which is why a 2000-photo RAW folder opens in seconds instead
 of minutes.
 
+Capture time is read from EXIF, including out of the TIFF-container RAWs (NEF,
+ARW, CR2, DNG and most others), so a RAW-only shoot sorts and date-splits by
+when it was shot rather than by file mtime. The formats that aren't TIFF
+underneath — CR3 above all — still fall back to mtime.
+
 A RAW and a JPEG with the same base name collapse into one grid item tagged
 `JPG+RAW`. Marking, comparing, exporting and deleting then act on both files, so
 the pair never drifts apart. Turn it off with the **group RAW+JPG** checkbox.
@@ -54,13 +59,24 @@ the pair never drifts apart. Turn it off with the **group RAW+JPG** checkbox.
 ## Culling
 
 The grid lazy-loads cached thumbnails; the size slider is remembered between
-sessions. Sort by filename, date taken, date modified, size or rating, newest
-first by default. Filter down to keepers, rejects, unflagged or rated photos.
-The header counts how many photos are still unflagged ("N to cull").
+sessions, as is everything else in that bar — sort, direction, filter and the
+filename box all come back the way you left them. Sort by filename, date taken,
+date modified, size or rating, newest first by default. Filter down to keepers,
+rejects, unflagged or rated photos, type a few characters to filter by filename
+(`/` jumps to the box), and switch the thumbnails between showing the whole
+frame and filling the cell. The header counts how many photos are still
+unflagged ("N to cull").
+
+Photos can be selected as well as flagged: `Space` toggles one, shift-click
+takes the range from the cursor, ctrl-click picks individual frames, and `A`
+takes everything the filter is showing. The selection is what compare opens,
+what `Shift`+a flag or a rating marks in one go, what a paste or a preset
+applies to, and what Export can be pointed at directly.
 
 Flags are keep/reject and ratings are 0 to 5 stars. Both are stored in SQLite,
 so reopening the folder brings your marks back. `U` reverts the last flag or
-rating, including a full compare verdict in one press.
+rating, including a full compare verdict — or a whole `Shift`-marked selection —
+in one press.
 
 Compare puts up to 3 images side by side with synchronized zoom and pan: zoom
 one and all of them zoom. `S`, `D` or `F` keeps that frame and rejects the
@@ -71,7 +87,11 @@ it, rejects the rest and closes.
 ## Editing
 
 Loupe view has scroll-to-zoom, drag-to-pan, and a docked edit sidebar. `Tab`
-hides the whole panel; every section collapses on its own.
+hides the whole panel; every section collapses on its own. `Z` (or a
+double-click) flips between fitting the frame and 100%, centred on the pointer,
+so checking focus is one keystroke. A filmstrip along the bottom shows where in
+the shoot you are and jumps to any frame you click — `L` hides it — and the
+edges of the picture are prev/next buttons for when the hand is on the mouse.
 
 **Crop & Rotate** — rotate in 90° steps, flip, straighten by a fine angle (with
 auto-crop to the largest inscribed rectangle), and crop (`C`, then drag a box).
@@ -166,11 +186,14 @@ spots are remapped into the new frame instead.
 
 ## Getting photos back out
 
-**Export** copies or moves kept, rejected or rated photos into a folder,
-defaulting to `<photo folder>/cull_output`, optionally keeping the subfolder
-structure. Edited photos are exported as JPEG with the crop, rotation and tone
-applied; everything else is copied byte for byte. Optionally re-encode JPEGs at
-a chosen quality on the way out, EXIF included.
+**Export** copies or moves kept, rejected, rated — or exactly what is selected
+in the grid — into a folder, defaulting to `<photo folder>/cull_output`,
+optionally keeping the subfolder structure. Edited photos are exported as JPEG
+with the crop, rotation and tone applied; everything else is copied byte for
+byte. Optionally re-encode JPEGs at a chosen quality on the way out. Either way
+the camera, lens, exposure and capture date travel with the file: EXIF is taken
+off the original, with only the orientation tag dropped because the pixels are
+already the right way up.
 
 When the library holds RAW files, the export dialog adds three switches, and
 they are independent — tick any combination:
@@ -207,15 +230,21 @@ so the whole cull runs under the left hand and the right one stays on the mouse.
 
 | Key | Action |
 | --- | --- |
-| `E` `S` `D` `F` (or arrows) | Move selection (up / left / down / right) |
+| `E` `S` `D` `F` (or arrows) | Move the cursor (up / left / down / right) |
 | `Home` / `End` | First / last photo |
+| `PgUp` / `PgDn` | A screenful at a time |
+| `/` | Filter by filename (`Esc` clears it) |
 | `G` / `Enter` | Open loupe (full) view |
 | `Esc` | Back / close |
 | `W` | Flag **Keep** (auto-advances) |
 | `R` | Flag **Reject** (auto-advances) |
 | `Q` | Clear flag |
-| `1`-`5` | Star rating, `` ` `` = 0 stars |
-| `U` | Undo last mark (flag/rating) |
+| `1`-`5` | Star rating, `0` or `` ` `` = no stars |
+| `Shift` + any mark key | Mark the whole selection at once |
+| `U` | Undo last mark (a bulk mark undoes as one) |
+| `A` | Select everything the filter shows, or clear it |
+| `Z` | Loupe/compare: fit ⇄ 100% |
+| `L` | Loupe: show/hide the filmstrip |
 | `P` | Retouch mode (loupe) |
 | `Ctrl`+`Z` / `Ctrl`+`Y` | Undo / redo edits (loupe) |
 | `Ctrl`+`C` / `Ctrl`+`V` | Copy / paste edits between photos (loupe) |
@@ -228,9 +257,15 @@ so the whole cull runs under the left hand and the right one stays on the mouse.
 | `B` | Toggle **mouse mode** |
 | `V` / `?` | Show shortcuts |
 
+With a mouse, the ‹ › edges of the loupe step through the folder and the
+filmstrip jumps straight to a frame. The folder tree takes the arrow keys too:
+up and down move, right descends, left goes back up, `Enter` opens, `Esc`
+closes.
+
 In loupe and compare, scroll (or `E`/`D`) zooms, dragging pans and stays synced
 across compare panes, `S`/`F` moves to the previous or next photo in loupe and
-focuses a pane in compare, and `Z` or a double-click resets the zoom. Marking
+focuses a pane in compare, and `Z` or a double-click flips between fitting the
+frame and 100% under the pointer. Marking
 keys keep working, and so does the edit bar: crop (`C`), retouch (`P`) and
 every slider act on whichever photo is current. In retouch mode the left button
 paints, so pan with the middle button.
@@ -270,13 +305,22 @@ PHOTO_CULLER_HOME=/tmp/culler-scratch python app.py
 
 - RAW orientation comes from the embedded preview's EXIF, so a RAW can
   occasionally show up unrotated.
-- Grid thumbnails of a RAW always come from its embedded preview, so a folder
-  still opens in seconds. Only the loupe switches to the full decode, and only
-  when the export is set to render from the RAW.
-- Previews apply edits at 2400px while the export applies them at full size, so
-  filters measured in pixels rather than proportions — grain, sharpening, noise
-  reduction — come out slightly stronger in the preview.
+- In JPEG view every RAW thumbnail comes from the embedded preview, which is
+  what makes a folder open in seconds. Switching the loupe to RAW switches the
+  grid with it, so the first pass over a RAW folder in that mode pays a
+  demosaic per file — cached on disk, so only once.
+- A RAW that libraw cannot read (a truncated file, a body newer than the
+  installed libraw) reports itself and the loupe falls back to the camera
+  JPEG. Exporting one is refused and listed in the export's errors rather than
+  silently writing the preview instead of the negative.
+- Previews apply edits at 2400px while the export applies them at full size.
+  Grain is sized against the frame, so it matches; sharpening and noise
+  reduction still work on a fixed pixel radius and come out slightly stronger
+  in the preview.
 - Clarity, noise reduction and the lens corrections are full-frame filters, so
   an export with those on costs a few seconds per photo at 24MP and up.
 - The server binds to 127.0.0.1 only and has no authentication, which is fine
-  for a local tool and not fine on a shared machine.
+  for a local tool and not fine on a shared machine. It will only render files
+  that are in the open library, so a page in another tab cannot use it to read
+  the rest of the disk, but anything that can reach the port can still drive
+  the app.

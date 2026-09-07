@@ -4,6 +4,8 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Photo Culler</title>
+  <!-- inline so the browser stops asking for a /favicon.ico that isn't there -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23161616'/%3E%3Ccircle cx='16' cy='17' r='7' fill='none' stroke='%234a9eff' stroke-width='3'/%3E%3Crect x='9' y='6' width='8' height='4' rx='1.5' fill='%234a9eff'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -19,7 +21,11 @@
     </div>
     <div class="right">
       <span id="counts" class="counts"></span>
-      <select id="filterSel" title="Filter (V)">
+      <label class="searchbox" title="Filter by filename (/ to focus, Esc to clear)">
+        <span>🔍</span>
+        <input id="searchBox" type="search" placeholder="filename…" spellcheck="false" />
+      </label>
+      <select id="filterSel" title="Filter (T cycles)">
         <option value="all">All</option>
         <option value="keep">Keep</option>
         <option value="reject">Reject</option>
@@ -41,13 +47,14 @@
         <span>⊞</span>
         <input id="gridSize" type="range" min="110" max="440" step="10" value="200" />
       </label>
-      <button id="mouseBtn" title="Mouse mode (B) — hotkeys act on hovered photo">🖱 Mouse</button>
+      <button id="fitBtn" title="Thumbnails: fit the whole frame, or fill the cell">▣ Fit</button>
+      <button id="mouseBtn" title="Mouse mode (B) — hotkeys act on the hovered photo">🖱</button>
       <select id="presetGridSel" title="Apply a saved preset to the compare selection (Space to multi-select), or the current photo">
         <option value="">🎛 Preset…</option>
       </select>
       <button id="presetGridApply" title="Apply the selected preset">Apply</button>
-      <button id="pasteBtn" title="Copy edits first: open a photo, Ctrl+C" disabled>📋 Paste edits</button>
-      <button id="splitBtn" title="Move files into date-named subfolders">📅 Date split…</button>
+      <button id="pasteBtn" title="Copy edits first: open a photo, Ctrl+C" disabled>📋 Paste</button>
+      <button id="splitBtn" title="Move files into date-named subfolders">📅 Split…</button>
       <button id="exportBtn">Export…</button>
       <button id="helpBtn" title="Shortcuts (V or ?)">?</button>
     </div>
@@ -253,8 +260,18 @@
         <div class="ed-hint">Tab hides this panel</div>
       </aside>
       <button id="sidebarToggle" class="sidebar-toggle-tab" title="Toggle edit panel (Tab)">◂</button>
+      <button id="loupePrev" class="loupenav prev" title="Previous photo (S or ←)">‹</button>
+      <button id="loupeNext" class="loupenav next" title="Next photo (F or →)">›</button>
     </div>
-    <div id="viewerHud" class="hud"></div>
+    <div id="filmstrip" class="filmstrip hidden"></div>
+    <div id="viewerHud" class="hud">
+      <span id="hudLeft"></span>
+      <span class="hudright">
+        <span id="hudInfo"></span>
+        <button id="zoomFitBtn" title="Fit ⇄ 100% (Z, or double-click the photo)">1:1</button>
+        <button id="stripBtn" title="Filmstrip (L)">▤</button>
+      </span>
+    </div>
   </div>
 
   <!-- Help -->
@@ -267,27 +284,39 @@
           <ul>
             <li><kbd>E</kbd><kbd>S</kbd><kbd>D</kbd><kbd>F</kbd> move (or arrows)</li>
             <li><kbd>Home</kbd>/<kbd>End</kbd> first / last</li>
+            <li><kbd>PgUp</kbd>/<kbd>PgDn</kbd> a screenful</li>
             <li><kbd>G</kbd> / <kbd>Enter</kbd> loupe view</li>
             <li><kbd>Esc</kbd> back / close</li>
             <li><kbd>T</kbd> cycle filter</li>
+            <li><kbd>/</kbd> filter by filename</li>
             <li><kbd>V</kbd> this help</li>
+          </ul>
+          <h3>Select</h3>
+          <ul>
+            <li><kbd>Space</kbd> add/remove the current photo</li>
+            <li><kbd>A</kbd> select everything shown, or clear it</li>
+            <li><kbd>X</kbd> clear the selection</li>
+            <li><kbd>Shift</kbd>+click a cell selects the range from the cursor;
+              <kbd>Ctrl</kbd>+click toggles one</li>
+            <li>the selection is what compare, a bulk mark, a paste and a
+              preset all act on</li>
           </ul>
         </div>
         <div>
           <h3>Mark</h3>
           <ul>
             <li><kbd>W</kbd> keep&nbsp;&nbsp;<kbd>R</kbd> reject&nbsp;&nbsp;<kbd>Q</kbd> clear flag</li>
-            <li><kbd>1</kbd>–<kbd>5</kbd> stars&nbsp;&nbsp;<kbd>`</kbd> 0 stars</li>
-            <li><kbd>U</kbd> undo last mark</li>
+            <li><kbd>1</kbd>–<kbd>5</kbd> stars&nbsp;&nbsp;<kbd>0</kbd> or <kbd>`</kbd> no stars</li>
+            <li><kbd>Shift</kbd>+any of those marks the whole selection at once</li>
+            <li><kbd>U</kbd> undo last mark (a bulk mark undoes as one)</li>
             <li>flags auto-advance to next</li>
           </ul>
           <h3>Compare</h3>
           <ul>
-            <li><kbd>Space</kbd> add/remove from compare set</li>
-            <li><kbd>C</kbd> open compare (set, or current+next)</li>
-            <li><kbd>X</kbd> clear compare set</li>
+            <li><kbd>C</kbd> open compare (the selection, or current+next)</li>
             <li><kbd>S</kbd><kbd>D</kbd><kbd>F</kbd> (≤3 in compare) keep that one, reject rest, close</li>
-            <li>&gt;3 selected → vote <kbd>←</kbd>/<kbd>S</kbd> vs <kbd>→</kbd>/<kbd>F</kbd> to find the best</li>
+            <li>&gt;3 selected → vote <kbd>←</kbd>/<kbd>S</kbd> vs <kbd>→</kbd>/<kbd>F</kbd> to find the best
+              (it asks first past a dozen — that is a lot of votes)</li>
           </ul>
           <h3>Edit multiple (grid)</h3>
           <ul>
@@ -302,8 +331,11 @@
           <ul>
             <li><kbd>scroll</kbd> / <kbd>E</kbd><kbd>D</kbd> zoom (synced)</li>
             <li><kbd>drag</kbd> pan (synced in compare)</li>
-            <li><kbd>S</kbd><kbd>F</kbd> prev / next (loupe)</li>
-            <li><kbd>Z</kbd> / dblclick reset zoom</li>
+            <li><kbd>S</kbd><kbd>F</kbd> prev / next (loupe), or the ‹ › edges</li>
+            <li><kbd>Home</kbd>/<kbd>End</kbd> first / last</li>
+            <li><kbd>Z</kbd> or double-click: fit ⇄ 100%, centred on the pointer</li>
+            <li><kbd>L</kbd> filmstrip — click any frame to jump to it</li>
+            <li><kbd>Space</kbd> add/remove from the selection</li>
             <li>marking works here too</li>
           </ul>
           <h3>Edit (loupe sidebar)</h3>
@@ -363,6 +395,11 @@
             <li><kbd>B</kbd> toggle mouse mode</li>
             <li>hotkeys act on the hovered photo</li>
           </ul>
+          <h3>Folder tree</h3>
+          <ul>
+            <li>arrows (or <kbd>E</kbd><kbd>S</kbd><kbd>D</kbd><kbd>F</kbd>) move and
+              descend, <kbd>Enter</kbd> opens, <kbd>Esc</kbd> closes</li>
+          </ul>
         </div>
       </div>
       <button id="helpClose">Close</button>
@@ -381,9 +418,10 @@
       <div class="row">
         <label>Which<br/>
           <select id="exSel">
-            <option value="keep">Kept (P)</option>
-            <option value="reject">Rejected (X)</option>
+            <option value="keep">Kept (W)</option>
+            <option value="reject">Rejected (R)</option>
             <option value="rated">Rated ≥</option>
+            <option value="selected">Selected in the grid</option>
           </select></label>
         <label>Min ★<br/>
           <select id="exMin"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></label>

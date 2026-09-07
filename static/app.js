@@ -10,6 +10,7 @@ const S = {
   cursor: 0,           // index into S.view
   filter: "all",
   typeFilter: "all",   // "all" | "raw" | "heic" | "std" | ".jpg" ...
+  search: "",          // filename substring, case-insensitive
   sortKey: "name",     // name | taken | mtime | size | rating
   sortDir: -1,         // 1 asc, -1 desc (default: filename descending = newest first)
   compare: [],         // ordered list of paths in the compare set
@@ -26,6 +27,8 @@ const S = {
   showGrid: true,      // alignment grid overlay in edit mode (default on)
   showHist: true,      // RGB histogram panel visible in loupe (default on)
   previewSrc: "jpeg",  // for a RAW+JPEG pair: which file the loupe renders
+  fillThumbs: false,   // grid thumbnails crop to the cell instead of letterboxing
+  showStrip: true,     // filmstrip under the loupe
 };
 
 // Remembered across sessions: whether the loupe shows the camera JPEG (instant,
@@ -43,6 +46,13 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+// Stroke coordinates are normalized 0..1, so five decimals is a twentieth of a
+// pixel on a 45MP frame — far finer than anything the brush can resolve. Full
+// double precision would spend eighteen characters a number, and the whole edit
+// stack travels in the live-preview query string, which the server cuts off at
+// 64 KB; rounding is what keeps a heavily retouched photo inside that.
+const rnd5 = (v) => Math.round(v * 1e5) / 1e5;
+
 const grid = $("grid");
 const viewer = $("viewer");
 const panesEl = $("panes");
@@ -98,6 +108,19 @@ function rawRenderPath(p) {
   return rawMemberPath(p);
 }
 
+// A render can fail: a truncated file, or a RAW this libraw build can't read.
+// In RAW view that is recoverable — the camera JPEG is right there — so drop
+// back to it and say why, rather than leaving a broken frame and a mode that
+// will fail again on the next photo.
+function previewFailed(path) {
+  if (S.previewSrc === "raw" && rawMemberPath(S.byPath.get(path))) {
+    toast("Could not decode the negative — showing the camera JPEG", 3600);
+    setPreviewSrc("jpeg");
+    return;
+  }
+  toast("Preview failed to render", 2400);
+}
+
 function setPreviewSrc(which) {
   if (S.previewSrc === which) return;
   S.previewSrc = which;
@@ -146,8 +169,14 @@ function toast(msg, ms = 1600) {
   const t = $("toast");
   t.textContent = msg;
   t.classList.remove("hidden");
+  // two frames: the element has to be laid out un-shown before `show` can
+  // transition it, or the browser collapses both into one paint
+  requestAnimationFrame(() => requestAnimationFrame(() => t.classList.add("show")));
   clearTimeout(toastT);
-  toastT = setTimeout(() => t.classList.add("hidden"), ms);
+  toastT = setTimeout(() => {
+    t.classList.remove("show");
+    toastT = setTimeout(() => t.classList.add("hidden"), 200);
+  }, ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +232,7 @@ function buildGroups() {
   }
   if (!S.groupRaw) return;
 
+  const drift = [];        // members whose stored mark disagrees with the group
   const map = new Map();   // "folder|base" -> [photos]
   for (const p of S.photos) {
     const key = (p.folder || "") + "|" + baseName(p);
@@ -222,11 +252,45 @@ function buildGroups() {
     primary.hasStd = members.some((m) => typeGroup(m.ext) === "std");
     primary.hasHeic = members.some((m) => HEIC_EXTS.has(m.ext));
     // reconcile display state to the strongest member mark
+    const wasFlag = primary.flag, wasRating = primary.rating;
     primary.rating = Math.max(...members.map((m) => m.rating || 0));
     const rej = members.find((m) => m.flag === -1);
     const keep = members.find((m) => m.flag === 1);
-    primary.flag = primary.flag || (rej ? -1 : keep ? 1 : 0);
-    for (let i = 1; i < members.length; i++) members[i]._hidden = true;
+    primary.flag = wasFlag || (rej ? -1 : keep ? 1 : 0);
+    // the primary carries the reconciled mark too, and it is just as likely to
+    // be the one that moved — a RAW rejected in an earlier session pulls the
+    // JPEG fronting it along
+    if (primary.flag !== wasFlag || primary.rating !== wasRating) drift.push(primary);
+    for (let i = 1; i < members.length; i++) {
+      members[i]._hidden = true;
+      // Members can genuinely disagree: a folder culled before grouping was
+      // switched on, or a RAW marked in another session. The cell shows one
+      // reconciled mark, so the files behind it have to carry it too —
+      // otherwise "delete rejected" expands the group, finds only half of it
+      // flagged, and refuses the whole batch with a count mismatch.
+      if (members[i].flag !== primary.flag || members[i].rating !== primary.rating) {
+        members[i].flag = primary.flag;
+        members[i].rating = primary.rating;
+        drift.push(members[i]);
+      }
+    }
+  }
+  syncGroupMarks(drift);
+}
+
+// Write reconciled group marks back, quietly and in one request. Normally
+// there is nothing to do; when there is, doing it now is what keeps the DB
+// agreeing with the cell the user is looking at.
+function syncGroupMarks(drift) {
+  if (!drift.length) return;
+  const byMark = new Map();
+  for (const p of drift) {
+    const k = p.flag + "/" + p.rating;
+    (byMark.get(k) || byMark.set(k, []).get(k)).push(p.path);
+  }
+  for (const [k, paths] of byMark) {
+    const [flag, rating] = k.split("/").map(Number);
+    post("/api/mark", { paths, flag, rating }).catch(() => {});
   }
 }
 
@@ -362,9 +426,18 @@ function matchesType(p, t) {
   if (t === "raw" || t === "heic" || t === "std") return exts.some((e) => typeGroup(e) === t);
   return exts.includes(t);  // exact extension
 }
+function matchesSearch(p, q) {
+  if (!q) return true;
+  // a group is one item, so a search that names the RAW should find the cell
+  // its JPEG is fronting
+  if (p.filename.toLowerCase().includes(q)) return true;
+  return !!(p.members && p.members.some(
+    (m) => m.slice(m.replace(/\\/g, "/").lastIndexOf("/") + 1).toLowerCase().includes(q)));
+}
 function matches(p) {
   if (p._hidden) return false;
-  return matchesFlag(p, S.filter) && matchesType(p, S.typeFilter);
+  return matchesFlag(p, S.filter) && matchesType(p, S.typeFilter) &&
+         matchesSearch(p, S.search);
 }
 function applyFilter() {
   S.view = S.photos.filter(matches);
@@ -387,7 +460,8 @@ function updateCounts() {
     `<b style="color:var(--reject)">${reject}</b> reject · ` +
     (left || !vis.length ? `<b>${left}</b> to cull · ` : `<b style="color:var(--keep)">done</b> · `) +
     `<b>${rated}</b> rated` +
-    (S.compare.length ? ` · <b style="color:var(--star)">${S.compare.length}</b> compare` : "");
+    (S.compare.length ? ` · <b style="color:var(--star)">${S.compare.length}</b> selected` : "") +
+    (S.search ? ` · <b>${S.view.length}</b> matching` : "");
 }
 
 // ---------------------------------------------------------------------------
@@ -457,12 +531,22 @@ function renderGrid() {
       `<div class="badges"><span class="flag"></span><span class="stars">${starStr(p.rating)}</span></div>`;
     if (i === S.cursor) cell.classList.add("sel");
     if (cmpIdx >= 0) cell.classList.add("cmp");
-    cell.addEventListener("click", () => { setCursor(i); });
+    // Plain click moves the cursor; the modifiers build a selection the way a
+    // file manager does, so a set can be gathered with the mouse alone instead
+    // of only with Space.
+    cell.addEventListener("click", (e) => {
+      if (e.shiftKey) { selectRange(S.cursor, i); return; }
+      if (e.ctrlKey || e.metaKey) { toggleCompare(p.path); setCursor(i, false); return; }
+      setCursor(i);
+    });
     cell.addEventListener("dblclick", () => openLoupe(i));
     cell.addEventListener("mouseenter", () => { if (S.mouseMode) setHover(i); });
     cell.addEventListener("mouseleave", () => { if (S.hover === i) setHover(null); });
+    const thumb = cell.querySelector("img");
+    // an undecodable negative in RAW view must not leave a row of broken icons
+    thumb.addEventListener("error", () => previewFailed(p.path), { once: true });
     frag.appendChild(cell);
-    io.observe(cell.querySelector("img"));
+    io.observe(thumb);
   });
   grid.appendChild(frag);
   const selCell = grid.querySelector(`.cell[data-i="${S.cursor}"]`);
@@ -525,6 +609,14 @@ function columns() {
   return style.gridTemplateColumns.split(" ").length;
 }
 
+// how many rows a Page Up/Down should move: one screenful, minus a row of
+// overlap so you can see where you came from
+function rowsPerScreen() {
+  const cell = grid.querySelector(".cell");
+  const h = cell ? cell.offsetHeight + 8 : 208;
+  return Math.max(1, Math.floor(grid.clientHeight / h) - 1);
+}
+
 function setHover(i) {
   const old = S.hover;
   if (old != null) {
@@ -584,7 +676,7 @@ function undoMark() {
       .catch((e) => toast("Save failed: " + e.message));
   }
   updateCounts();
-  if (S.viewer) renderViewerMeta();
+  if (S.viewer) { renderViewerMeta(); syncFilmstrip(last.map((it) => it.path)); }
   toast("Mark undone");
 }
 
@@ -604,7 +696,7 @@ async function mark(path, fields, record = true) {
   // reflect in UI immediately
   const vi = S.view.indexOf(p);
   if (vi >= 0) refreshCell(vi);
-  if (S.viewer) renderViewerMeta();
+  if (S.viewer) { renderViewerMeta(); syncFilmstrip([path]); }
   updateCounts();
   try {
     await Promise.all(targets.map((tp) =>
@@ -635,6 +727,37 @@ function markCurrent(fields, advance) {
   if (advance && !(S.mouseMode && !S.viewer)) advanceCurrent();
 }
 
+// Shift + a flag or a rating key marks the whole selection at once. One
+// snapshot, so U takes the whole batch back, and one request, so 200 photos is
+// as fast as one.
+async function markSelection(fields) {
+  const targets = S.compare.slice();
+  if (!targets.length) { toast("Nothing selected — Space, or shift-click, to select"); return; }
+  snapshotMarks(targets);
+  const paths = [];
+  for (const pp of targets) {
+    const p = S.byPath.get(pp);
+    if (!p) continue;
+    for (const tp of (p.members && p.members.length ? p.members : [pp])) {
+      const t = S.byPath.get(tp);
+      if (!t || paths.includes(tp)) continue;
+      if (fields.flag !== undefined) t.flag = fields.flag;
+      if (fields.rating !== undefined) t.rating = fields.rating;
+      paths.push(tp);
+    }
+  }
+  S.view.forEach((p, i) => { if (targets.includes(p.path)) refreshCell(i); });
+  updateCounts();
+  if (S.viewer) { renderViewerMeta(); syncFilmstrip(targets); }
+  const what = fields.flag !== undefined
+    ? { 1: "kept", "-1": "rejected", 0: "unflagged" }[fields.flag]
+    : `rated ${fields.rating}★`;
+  toast(`${targets.length} photo${targets.length === 1 ? "" : "s"} ${what}`);
+  try {
+    await post("/api/mark", { paths, flag: fields.flag, rating: fields.rating });
+  } catch (e) { toast("Save failed: " + e.message); }
+}
+
 function advanceCurrent() {
   if (S.viewer) {
     if (S.viewer.mode === "loupe" && S.viewer.cur < S.viewer.paths.length - 1)
@@ -647,16 +770,60 @@ function advanceCurrent() {
 // ---------------------------------------------------------------------------
 // Compare set
 // ---------------------------------------------------------------------------
+// The compare set doubles as the grid's selection: 3 or fewer open side by
+// side, more run the tournament, and any size is a target for a bulk mark,
+// a paste or a preset. The cap is what a tournament stays sane at.
+const COMPARE_MAX = 200;
 function toggleCompare(path) {
   const i = S.compare.indexOf(path);
   if (i >= 0) S.compare.splice(i, 1);
-  else { if (S.compare.length >= 16) { toast("Compare max 16"); return; } S.compare.push(path); }
+  else {
+    if (S.compare.length >= COMPARE_MAX) { toast(`Compare holds at most ${COMPARE_MAX}`); return; }
+    S.compare.push(path);
+  }
   const vi = S.view.findIndex((p) => p.path === path);
   if (vi >= 0) refreshCell(vi);
   // renumber others
   S.view.forEach((p, idx) => { if (S.compare.includes(p.path)) refreshCell(idx); });
   updateCounts();
   updatePasteBtn();
+}
+
+// Shift-click: add everything between the cursor and the clicked cell, then
+// leave the cursor on the click so a second shift-click extends from there.
+function selectRange(from, to) {
+  const lo = Math.min(from, to), hi = Math.max(from, to);
+  let added = 0;
+  for (let i = lo; i <= hi; i++) {
+    const p = S.view[i];
+    if (!p || S.compare.includes(p.path)) continue;
+    if (S.compare.length >= COMPARE_MAX) { toast(`Compare holds at most ${COMPARE_MAX}`); break; }
+    S.compare.push(p.path);
+    added++;
+  }
+  setCursor(to, false);
+  S.view.forEach((p, idx) => { if (S.compare.includes(p.path)) refreshCell(idx); });
+  updateCounts();
+  updatePasteBtn();
+  if (added) toast(`${S.compare.length} selected`, 900);
+}
+
+// Select every photo the filter is currently showing, or clear the selection if
+// they are already all in it — one key for "all of these" and "none of these".
+function toggleSelectAll() {
+  if (!S.view.length) return;
+  if (S.compare.length >= Math.min(S.view.length, COMPARE_MAX)) {
+    clearCompare("Selection cleared");
+    return;
+  }
+  S.compare = S.view.slice(0, COMPARE_MAX).map((p) => p.path);
+  const sy = grid.scrollTop;
+  applyFilter();
+  grid.scrollTop = sy;
+  updatePasteBtn();
+  toast(S.compare.length < S.view.length
+    ? `Selected the first ${S.compare.length} of ${S.view.length}`
+    : `Selected all ${S.compare.length}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -714,9 +881,17 @@ function openCompare() {
   if (paths.length <= 3) {
     S.viewer = { mode: "compare", paths, cur: 0, zoom: 1, panx: 0, pany: 0 };
     buildPanes();
-  } else {
-    startTournament(paths);
+    return;
   }
+  // The selection is also what bulk marks and presets act on, so it can be
+  // hundreds of photos deliberately. A tournament over that many is a hundred
+  // votes, which is never what C meant — ask before starting one.
+  if (paths.length > 12 &&
+      !confirm(`Run a knock-out over ${paths.length} photos? That is ` +
+               `${paths.length - 1} votes. Cancel to keep the selection as it is.`)) {
+    return;
+  }
+  startTournament(paths);
 }
 
 // ---------------------------------------------------------------------------
@@ -780,7 +955,7 @@ function buildPanes() {
       if (idx === 0) paneBusy(null);
       computeFit(idx, pane, img); applyTransform(); drawHistogram();
     };
-    img.onerror = () => { if (idx === 0) paneBusy(null); };
+    img.onerror = () => { if (idx === 0) { paneBusy(null); previewFailed(path); } };
     if (idx === 0) paneBusy(busyLabelFor(path));
     img.src = previewUrl(path);
     const label = document.createElement("div");
@@ -827,10 +1002,26 @@ function buildPanes() {
     $("metaPanel").classList.add("hidden");
     $("histPanel").classList.add("hidden");
   }
+  buildFilmstrip();
+  syncLoupeNav();
   // the sidebar just appeared/disappeared, changing the pane's available
   // width before any image has necessarily loaded — refit defensively
   refitPanes();
   renderViewerMeta();
+}
+
+// The edge chevrons exist for the mouse; they are hidden outside loupe view and
+// greyed at the ends of the folder so the arrow never lies about there being
+// another photo.
+function syncLoupeNav() {
+  const v = S.viewer;
+  const loupe = !!v && v.mode === "loupe";
+  for (const [id, ok] of [["loupePrev", loupe && v.cur > 0],
+                          ["loupeNext", loupe && v.cur < v.paths.length - 1]]) {
+    const b = $(id);
+    b.classList.toggle("hidden", !loupe);
+    b.disabled = !ok;
+  }
 }
 
 // A full RAW decode takes seconds and the pane would just sit there showing the
@@ -861,7 +1052,7 @@ function loadIntoPane(pane, url, done) {
   const img = pane._img;
   paneBusy(busyLabelFor(S.viewer.paths[S.viewer.cur]));
   const finish = () => { paneBusy(null); done(); };
-  img.onerror = () => paneBusy(null);
+  img.onerror = () => { paneBusy(null); previewFailed(S.viewer.paths[S.viewer.cur]); };
   img.onload = finish;
   if (img.getAttribute("src") !== url) {
     img.src = url;
@@ -952,6 +1143,33 @@ function resetZoom() {
   applyTransform(); updateHud();
 }
 
+// The zoom the pane needs for one image pixel to land on one screen pixel.
+// Capped, because a 45MP frame in a narrow compare pane can want more than the
+// zoom range allows.
+function oneToOneZoom(f) {
+  return f && f.fit ? Math.min(16, 1 / f.fit) : 1;
+}
+
+// Fit ⇄ 100%, Lightroom's Z. Zooming to 100% keeps whatever the pointer is over
+// under the pointer, so double-clicking a face lands on that face; zooming back
+// out always returns to the whole frame.
+function zoomToggle(screenX, screenY) {
+  const v = S.viewer;
+  if (!v) return;
+  const pane = panesEl.children[v.mode === "loupe" ? 0 : Math.max(0, v.cur)];
+  if (!pane) return;
+  const f = v._fit[+pane.dataset.idx];
+  if (!f) return;
+  if (v.zoom > 1.001) { resetZoom(); return; }
+  const target = oneToOneZoom(f);
+  if (target <= 1.001) { toast("Already showing every pixel", 900); return; }
+  if (screenX === undefined) {
+    const r = pane.getBoundingClientRect();
+    screenX = r.left + r.width / 2; screenY = r.top + r.height / 2;
+  }
+  zoomAt(screenX, screenY, target / v.zoom);
+}
+
 // One window-level drag handler for all panes (panes are rebuilt constantly;
 // per-pane window listeners would pile up and never be removed).
 let paneDrag = null;   // {pane, lx, ly} while the mouse is panning a pane
@@ -977,16 +1195,105 @@ function attachPaneHandlers(pane, idx) {
 
   pane.addEventListener("mousedown", (e) => {
     if (S.viewer.mode === "compare") { S.viewer.cur = idx; markCurPane(); }
+    if (e.button === 2) return;   // right-click opens the menu; it must not pan
     paneDrag = { pane, lx: e.clientX, ly: e.clientY };
     pane.classList.add("grabbing");
   });
-  pane.addEventListener("dblclick", () => resetZoom());
+  // panning with the middle button is the documented way to move around while
+  // retouching, and the browser's autoscroll would fight it
+  pane.addEventListener("auxclick", (e) => { if (e.button === 1) e.preventDefault(); });
+  pane.addEventListener("dblclick", (e) => zoomToggle(e.clientX, e.clientY));
 }
 
 function markCurPane() {
   if (S.viewer.mode !== "compare") return;
   [...panesEl.children].forEach((p) => p.classList.toggle("cur", +p.dataset.idx === S.viewer.cur));
   renderViewerMeta();
+}
+
+// ---- filmstrip: the rest of the shoot along the bottom of the loupe. It is
+// how you get around with the mouse without going back to the grid, and it is
+// the only thing in loupe view that shows where in the folder you are.
+// Built once per loupe session (the path list is fixed for its lifetime) and
+// lazily loaded, so opening the loupe on photo 1 of 3000 costs one screenful
+// of thumbnails, not three thousand. ----
+let stripIo = null;
+function buildFilmstrip() {
+  const el = $("filmstrip");
+  const v = S.viewer;
+  const loupe = !!v && v.mode === "loupe";
+  const show = loupe && S.showStrip;
+  $("stripBtn").classList.toggle("active", S.showStrip);
+  $("stripBtn").disabled = !loupe;      // compare and the tournament have no strip
+  $("zoomFitBtn").disabled = !v;
+  el.classList.toggle("hidden", !show);
+  if (!show) { el.innerHTML = ""; return; }
+  if (stripIo) stripIo.disconnect();
+  stripIo = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      const img = e.target;
+      if (!img.src && img.dataset.src) img.src = img.dataset.src;
+      stripIo.unobserve(img);
+    }
+  }, { root: el, rootMargin: "600px" });
+
+  const frag = document.createDocumentFragment();
+  v.paths.forEach((path, i) => {
+    const p = S.byPath.get(path);
+    const cell = document.createElement("div");
+    cell.className = "fs-cell";
+    cell.dataset.i = i;
+    cell.title = p ? p.filename : "";
+    cell.innerHTML = `<img data-src="${thumbUrl(path)}" alt="" />` +
+      `<span class="fs-flag"></span><span class="fs-stars"></span>`;
+    cell.addEventListener("click", () => loupeGo(i));
+    frag.appendChild(cell);
+    stripIo.observe(cell.querySelector("img"));
+  });
+  el.innerHTML = "";
+  el.appendChild(frag);
+  stripCur = -1;
+  syncFilmstrip(v.paths);
+}
+
+// Marks and the current-photo highlight change constantly; the cells don't.
+// Only the frames that actually moved are rewritten — `paths` names them, and
+// the old and new cursor positions are always included. Rewriting all three
+// thousand of them on every keystroke of a cull would be felt.
+let stripCur = -1;
+function syncFilmstrip(paths) {
+  const el = $("filmstrip");
+  if (el.classList.contains("hidden") || !el.children.length) return;
+  const v = S.viewer;
+  if (!v || v.mode !== "loupe") return;
+  const touched = new Set([v.cur, stripCur].filter((i) => i >= 0));
+  if (paths) {
+    const want = new Set(paths);
+    v.paths.forEach((path, i) => { if (want.has(path)) touched.add(i); });
+  }
+  for (const i of touched) {
+    const cell = el.children[i];
+    const p = cell && S.byPath.get(v.paths[i]);
+    if (!p) continue;
+    cell.className = "fs-cell" +
+      (p.flag === 1 ? " flag-keep" : p.flag === -1 ? " flag-reject" : "") +
+      (i === v.cur ? " cur" : "") +
+      (S.compare.includes(p.path) ? " cmp" : "");
+    cell.querySelector(".fs-stars").textContent = starStr(p.rating);
+  }
+  if (stripCur !== v.cur) {
+    stripCur = v.cur;
+    const cur = el.children[v.cur];
+    if (cur) cur.scrollIntoView({ block: "nearest", inline: "center" });
+  }
+}
+
+function toggleFilmstrip() {
+  S.showStrip = !S.showStrip;
+  localStorage.setItem("showStrip", S.showStrip ? "1" : "0");
+  buildFilmstrip();
+  refitPanes();
 }
 
 // warm the browser (and server render) cache for the neighbours of the
@@ -1017,6 +1324,8 @@ function loupeGo(i) {
   if (gi >= 0) setCursor(gi, true);
   if (S.editor) bindEditor(v.paths[v.cur]);   // editor follows the current photo
   renderViewerMeta();
+  syncLoupeNav();
+  syncFilmstrip();
   if (S.showMeta) renderMeta();
   preloadNeighbors();
   drawHistogram();
@@ -1149,24 +1458,29 @@ function drawHistCurve(ctx, hist, w, h, color, fill) {
 // caches of per-photo stats computed from a fetched preview — the file's
 // pixels never change, so these are stable for the whole session; capped so
 // a long shoot doesn't grow them without bound
-const histCache = new Map();     // path -> {luma, means} of the ORIGINAL (edits={})
-const autoCache = new Map();     // path -> means of the AUTO-LEVELS-ONLY render
-function capCache(cache, path, val) {
-  cache.set(path, val);
+const histCache = new Map();     // key -> {luma, means} of the ORIGINAL (edits={})
+const autoCache = new Map();     // key -> means of the AUTO-LEVELS-ONLY render
+// The camera JPEG and the negative behind it are two different pictures, so the
+// "before" curve has to be cached per render source — keying on the path alone
+// left the JPEG's histogram overlaid on the RAW after the Info panel's switch.
+const statKey = (path) => path + "|" + S.previewSrc;
+function capCache(cache, key, val) {
+  cache.set(key, val);
   if (cache.size > 50) cache.delete(cache.keys().next().value);
 }
-// fetch `previewUrl(path, edits)`, run `compute` on its sampled pixels, cache by path in `cache`
+// fetch `previewUrl(path, edits)`, run `compute` on its sampled pixels, cache in `cache`
 function statsFromPreview(cache, path, edits, compute) {
-  if (cache.has(path)) return Promise.resolve(cache.get(path));
+  const key = statKey(path);
+  if (cache.has(key)) return Promise.resolve(cache.get(key));
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
       const pixels = sampleImageData(img);
       const val = pixels ? compute(pixels) : null;
-      capCache(cache, path, val);
+      if (val) capCache(cache, key, val);   // a failed read is not an answer to keep
       resolve(val);
     };
-    img.onerror = () => { capCache(cache, path, null); resolve(null); };
+    img.onerror = () => resolve(null);
     img.src = previewUrl(path, edits);
   });
 }
@@ -1309,29 +1623,47 @@ function updateHud() {
   if (v.mode === "tournament") {
     const l = S.byPath.get(v.left), r = S.byPath.get(v.right);
     const nm = (x) => (x ? escapeHtml(x.filename) : "");
-    $("viewerHud").innerHTML =
-      `<span>Which is better? <b>${nm(l)}</b> vs <b>${nm(r)}</b></span>` +
-      `<span>match ${v.round}/${v.total} · ←/S = left · →/F = right · Esc cancels</span>`;
+    $("hudLeft").innerHTML =
+      `Which is better? <b>${nm(l)}</b> vs <b>${nm(r)}</b>`;
+    $("hudInfo").textContent =
+      `match ${v.round}/${v.total} · ←/S = left · →/F = right · Esc cancels`;
     return;
   }
   const p = currentPhoto();
   const pos = v.mode === "loupe" ? `${v.cur + 1}/${v.paths.length}` : `compare ${v.paths.length}`;
-  $("viewerHud").innerHTML =
-    `<span>${p ? escapeHtml(p.filename) : ""}</span>` +
-    `<span>${pos} · zoom ${(v.zoom).toFixed(1)}× · scroll=zoom drag=pan · Esc to close</span>`;
+  const f = v._fit[v.mode === "loupe" ? 0 : Math.max(0, v.cur)];
+  // "100%" reads better than "6.1x" when that is what the zoom actually means
+  const oneToOne = f ? oneToOneZoom(f) : 1;
+  const zoomTxt = Math.abs(v.zoom - oneToOne) < 0.02 && oneToOne > 1.02
+    ? "100%" : `${v.zoom.toFixed(1)}×`;
+  $("hudLeft").textContent = p ? p.filename : "";
+  $("hudInfo").textContent =
+    `${pos} · zoom ${zoomTxt} · scroll=zoom · Z=100% · Esc to close`;
+  $("zoomFitBtn").classList.toggle("active", v.zoom > 1.001);
 }
 
 function closeViewer() {
   paneBusy(null);
   S.viewer = null;
   S.editor = null; S.cropMode = false;
-  const ov = document.getElementById("cropOverlay");
-  if (ov) ov.remove();
+  // retouch state outlived the viewer: the mode flag stayed on, so the button
+  // came back pressed and a stray mouseup could still push a stroke
+  S.spotMode = false; paint = null; spotCursor = null;
+  $("retouchBtn").classList.remove("active");
+  for (const id of ["cropOverlay", "spotOverlay"]) {
+    const el = document.getElementById(id);
+    if (el) el.remove();
+  }
   $("editBar").classList.add("hidden");
   $("editBar").classList.remove("collapsed-full");   // sidebar hide is transient, not a saved preference
   S.sidebarCollapsed = false;
   $("metaPanel").classList.add("hidden");
   $("histPanel").classList.add("hidden");
+  $("filmstrip").classList.add("hidden");
+  $("filmstrip").innerHTML = "";
+  if (stripIo) { stripIo.disconnect(); stripIo = null; }
+  $("loupePrev").classList.add("hidden");
+  $("loupeNext").classList.add("hidden");
   viewer.classList.add("hidden");
   panesEl.innerHTML = "";
 }
@@ -1376,6 +1708,14 @@ function bindEditor(path) {
 function pushEdit(edits) {
   const p = editorPhoto();
   if (!p) return;
+  // A slider double-clicked to a value it already had, a preset applied twice,
+  // Reset on an untouched photo: pushing an identical state would spend an undo
+  // step doing nothing, so Ctrl+Z would look broken for one press.
+  if (JSON.stringify(edits) === JSON.stringify(curEdits())) {
+    syncEditControls();
+    renderEditPreview();
+    return;
+  }
   p._hist = p._hist.slice(0, p._hidx + 1);
   p._hist.push(edits);
   p._hidx = p._hist.length - 1;
@@ -1459,7 +1799,9 @@ function renderEditPreview(overrideEdits, keepLive) {
   }
   const url = previewUrl(S.editor.path, edits);
   paneBusy(busyLabelFor(S.editor.path));
-  img.onerror = () => paneBusy(null);
+  // A failed draft used to just leave the previous frame up, so a preview that
+  // had stopped tracking the sliders looked like a slow one. Say so instead.
+  img.onerror = () => { paneBusy(null); previewFailed(S.editor.path); };
   img.onload = () => {
     paneBusy(null);
     if (!keepLive) {   // keepLive: a drag is in progress, its live layer stays
@@ -1550,7 +1892,12 @@ function editAction(act) {
     pushEdit(dropSpots(n, e)); return;
   }
   if (act === "flipH" || act === "flipV") {
-    const n = clone(e); n[act] = !n[act]; delete n.crop; pushEdit(dropSpots(n, e)); return;
+    const n = clone(e);
+    // remove rather than store `false`: a stack of switched-off flags is not an
+    // edit, and leaving them in lights the ✎ badge on an untouched photo
+    if (n[act]) delete n[act]; else n[act] = true;
+    delete n.crop;
+    pushEdit(dropSpots(n, e)); return;
   }
   if (act === "crop") { S.cropMode ? exitCropMode() : enterCropMode(); return; }
   if (act === "grid") return toggleGrid();
@@ -1665,7 +2012,7 @@ function updatePasteBtn() {
   if (!btn) return;
   btn.disabled = !copiedEdits;
   const n = S.compare.length;
-  btn.textContent = n ? `📋 Paste edits (${n})` : "📋 Paste edits";
+  btn.textContent = n ? `📋 Paste (${n})` : "📋 Paste";
   btn.title = copiedEdits
     ? `Paste copied edits onto ${n ? n + " selected photos" : "the current photo"} (Ctrl+V)`
     : "Copy edits first: open a photo, Ctrl+C";
@@ -2083,10 +2430,17 @@ function buildCropOverlay(pane) {
   });
 }
 
-// Retouch spots are stored in the *cropped* frame, so re-cropping would slide
+// Retouch entries are stored in the *cropped* frame, so re-cropping would slide
 // them off their blemishes. Map them through the old crop into the new one
-// instead of quietly throwing the retouch work away; spots that fall outside
-// the new frame are dropped because there is nothing left for them to fix.
+// instead of quietly throwing the retouch work away; entries that end up
+// entirely outside the new frame are dropped, because there is nothing left for
+// them to fix.
+//
+// An entry is {pts, r, dx, dy}: a painted region plus one source offset. The
+// pre-brush shape {x, y, sx, sy, r} still turns up in stacks saved before the
+// brush existed and in presets, so both are mapped. This used to map only the
+// old shape — on a current stroke every field came out NaN and the filter then
+// dropped it, so the first re-crop silently deleted the entire retouch stack.
 function remapSpots(spots, oldCrop, newCrop, nw, nh) {
   if (!spots || !spots.length) return spots;
   const o = oldCrop && oldCrop.length === 4 ? oldCrop : [0, 0, 1, 1];
@@ -2095,12 +2449,29 @@ function remapSpots(spots, oldCrop, newCrop, nw, nh) {
   if (cw <= 0 || ch <= 0 || ow <= 0 || oh <= 0) return spots;
   // the radius is a fraction of the frame's short edge, which just changed
   const rk = Math.min(ow * nw, oh * nh) / Math.min(cw * nw, ch * nh);
-  const mx = (x) => (o[0] + x * ow - newCrop[0]) / cw;
-  const my = (y) => (o[1] + y * oh - newCrop[1]) / ch;
-  return spots
-    .map((s) => Object.assign({}, s, { x: mx(s.x), y: my(s.y),
-                                       sx: mx(s.sx), sy: my(s.sy), r: s.r * rk }))
-    .filter((s) => s.x > 0 && s.x < 1 && s.y > 0 && s.y < 1);
+  const mx = (x) => rnd5((o[0] + x * ow - newCrop[0]) / cw);
+  const my = (y) => rnd5((o[1] + y * oh - newCrop[1]) / ch);
+  const inside = (x, y) => x > 0 && x < 1 && y > 0 && y < 1;
+
+  const out = [];
+  for (const s of spots) {
+    const n = Object.assign({}, s, { r: rnd5(s.r * rk) });
+    if (s.pts) {
+      n.pts = s.pts.map((p) => [mx(p[0]), my(p[1])]);
+      // dx/dy are a displacement, not a position: they rescale with the frame
+      // rather than translating with it
+      if (s.dx !== undefined) n.dx = rnd5(s.dx * ow / cw);
+      if (s.dy !== undefined) n.dy = rnd5(s.dy * oh / ch);
+      // any part of a stroke still on the picture is worth keeping
+      if (!n.pts.some((p) => inside(p[0], p[1]))) continue;
+    } else {
+      n.x = mx(s.x); n.y = my(s.y);
+      if (s.sx !== undefined) { n.sx = mx(s.sx); n.sy = my(s.sy); }
+      if (!inside(n.x, n.y)) continue;
+    }
+    out.push(n);
+  }
+  return out;
 }
 
 function cropAspectRatio() {
@@ -2121,6 +2492,7 @@ function cropAspectRatio() {
 // frame — what you paint on is exactly what the server heals, at any zoom.
 let paint = null;        // the stroke being drawn
 let spotCursor = null;   // {x, y} in pane pixels — where the brush ring is drawn
+
 
 function spotRadius() {
   return Math.max(0.005, Math.min(0.15, parseFloat($("spotSize").value) || 0.03));
@@ -2265,7 +2637,7 @@ function attachSpotHandlers(ov) {
       pushEdit(n);
       return;
     }
-    paint = { pts: [p], r: spotRadius(), mode: $("spotModeSel").value,
+    paint = { pts: [[rnd5(p[0]), rnd5(p[1])]], r: spotRadius(), mode: $("spotModeSel").value,
               tool: spotTool(), src: null, ox: e.clientX, oy: e.clientY, moved: false };
     drawSpotMarkers(ov);
   });
@@ -2313,7 +2685,7 @@ window.addEventListener("mousemove", (e) => {
     const last = paint.pts[paint.pts.length - 1];
     const short = Math.min(f.nw, f.nh);
     if (Math.hypot((u - last[0]) * f.nw / short, (v - last[1]) * f.nh / short) > paint.r / 3) {
-      paint.pts.push([u, v]);
+      paint.pts.push([rnd5(u), rnd5(v)]);
     }
   } else {
     paint.src = [u, v];   // the spot tool drags out a source instead
@@ -2353,7 +2725,8 @@ window.addEventListener("mouseup", async () => {
     }
   }
   const n = clone(curEdits());
-  n.spots = (n.spots || []).concat([{ pts: p.pts, r: p.r, dx, dy, mode: p.mode }]);
+  n.spots = (n.spots || []).concat([
+    { pts: p.pts, r: rnd5(p.r), dx: rnd5(dx), dy: rnd5(dy), mode: p.mode }]);
   pushEdit(n);
 });
 
@@ -2390,6 +2763,11 @@ function inField(e) {
   const t = e.target;
   return t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA");
 }
+
+// Marking keys, which flank the ESDF nav cluster and work everywhere:
+// W keep · R reject · Q clear flag · 1-5 stars · ` or 0 for no stars.
+const MARKS = { w: { flag: 1 }, r: { flag: -1 }, q: { flag: 0 },
+                "`": { rating: 0 }, "0": { rating: 0 } };
 
 document.addEventListener("keydown", (e) => {
   // editor undo/redo — handled first so it works even with a slider focused
@@ -2428,31 +2806,54 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   if (inField(e)) {
-    // Esc must always get you out — otherwise a focused slider traps the viewer
-    if (e.key === "Escape") { e.target.blur(); if (S.viewer) closeViewer(); }
+    if (e.key === "Escape") {
+      // Esc must always get you out — otherwise a focused slider traps the
+      // viewer. In the search box it clears the search first; a second press
+      // then leaves the field like anywhere else.
+      if (e.target === $("searchBox") && e.target.value) { setSearch(""); return; }
+      e.target.blur();
+      if (S.viewer) closeViewer();
+    }
     return;
   }
 
   const k = e.key.toLowerCase();
+
+  // While the folder tree is open it owns the keyboard, the way a modal does:
+  // you are picking a folder, not culling, and the grid behind the drawer is
+  // half-covered. Before this the panel could only be used with the mouse, and
+  // Esc did nothing at all while it was up.
+  if (!$("treePanel").classList.contains("hidden")) {
+    if (k === "escape") { treeClose(); return; }
+    if (treeKey(k)) e.preventDefault();
+    return;
+  }
+
+  // "/" jumps to the filename filter, the way it does in every list that has
+  // one. It has to come before the letter keys so the key itself isn't eaten.
+  if (e.key === "/" && !S.viewer) { e.preventDefault(); $("searchBox").focus(); return; }
+
   const inViewer = !!S.viewer;
+  // Shift aims a mark at the whole selection instead of the one photo under the
+  // cursor. Shifted digits arrive as !@#$% rather than 1-5, so the rating keys
+  // are read off the physical key.
+  const bulk = e.shiftKey && S.compare.length > 0;
+  const digit = /^Digit([1-5])$/.exec(e.code || "");
 
   // ---- marking: keys flanking the ESDF nav cluster, works everywhere ----
-  // W keep · R reject · Q clear flag · 1-5 stars · ` 0 stars
-  switch (k) {
-    case "w": markCurrent({ flag: 1 }, true); return;
-    case "r": markCurrent({ flag: -1 }, true); return;
-    case "q": markCurrent({ flag: 0 }, false); return;
-    case "`": markCurrent({ rating: 0 }, false); return;
-    case "u": undoMark(); return;
+  if ((MARKS[k] || digit) && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    const fields = digit ? { rating: +digit[1] } : MARKS[k];
+    if (bulk) markSelection(fields);
+    else markCurrent(fields, fields.flag === 1 || fields.flag === -1);
+    return;
   }
+  if (k === "u") { undoMark(); return; }
   // Compare best-pick: in compare view with ≤3 images, S/D/F keep that pane,
   // reject the rest, and close. (Overrides compare nav/zoom for those keys.)
   if (S.viewer && S.viewer.mode === "compare" && S.viewer.paths.length <= 3) {
     const pi = PICK_KEYS.indexOf(k);
     if (pi >= 0 && pi < S.viewer.paths.length) { pickBest(pi); return; }
   }
-  if (k >= "1" && k <= "5") { markCurrent({ rating: parseInt(k, 10) }, false); return; }
-
   if (inViewer) {
     if (S.cropMode) {   // crop drag in progress swallows nav/zoom; Esc cancels it
       if (k === "escape") exitCropMode();
@@ -2462,6 +2863,9 @@ document.addEventListener("keydown", (e) => {
     // leaves the mode first and only closes the viewer on a second press
     if (S.spotMode && k === "escape") { exitRetouch(); return; }
     if (k === "escape") { closeViewer(); return; }
+    // the shortcut sheet is most wanted from in here, where half the keys live
+    // — the viewer branch used to swallow V before the grid could act on it
+    if (k === "v" || k === "?") { showModal("help"); return; }
     // editor shortcuts (loupe only): O original/edited, C crop, I info, G grid, H histogram
     if (S.viewer.mode === "loupe" && S.editor) {
       if (k === "o") { toggleOriginal(); return; }
@@ -2477,7 +2881,7 @@ document.addEventListener("keydown", (e) => {
         case "arrowright": case "f": tournamentVote("right"); return;
         case "arrowup": case "e": case "+": case "=": zoomAtCenter(1.25); return;
         case "arrowdown": case "d": case "-": case "_": zoomAtCenter(0.8); return;
-        case "z": resetZoom(); return;
+        case "z": zoomToggle(); return;
       }
       return;
     }
@@ -2492,7 +2896,15 @@ document.addEventListener("keydown", (e) => {
         return;
       case "arrowup": case "e": case "+": case "=": zoomAtCenter(1.25); return;
       case "arrowdown": case "d": case "-": case "_": zoomAtCenter(0.8); return;
-      case "z": resetZoom(); return;
+      case "z": zoomToggle(); return;
+      case "l": if (S.viewer.mode === "loupe") toggleFilmstrip(); return;
+      case " ": {
+        const cp = currentPhoto();
+        if (cp) { toggleCompare(cp.path); syncFilmstrip([cp.path]); }
+        e.preventDefault(); return;
+      }
+      case "home": if (S.viewer.mode === "loupe") loupeGo(0); return;
+      case "end": if (S.viewer.mode === "loupe") loupeGo(S.viewer.paths.length - 1); return;
     }
     return;
   }
@@ -2514,8 +2926,11 @@ document.addEventListener("keydown", (e) => {
       if (!S.mouseMode) setCursor(idx + 1, true);
       e.preventDefault(); return;
     }
+    case "pageup": setCursor(S.cursor - cols * rowsPerScreen()); e.preventDefault(); return;
+    case "pagedown": setCursor(S.cursor + cols * rowsPerScreen()); e.preventDefault(); return;
     case "c": openCompare(); return;
-    case "x": clearCompare("Compare cleared"); return;
+    case "a": toggleSelectAll(); e.preventDefault(); return;
+    case "x": clearCompare("Selection cleared"); return;
     case "t": cycleFilter(); return;
     case "b": toggleMouseMode(); return;
     case "v": case "?": showModal("help"); return;
@@ -2527,6 +2942,17 @@ function zoomAtCenter(factor) {
   if (!pane) return;
   const r = pane.getBoundingClientRect();
   zoomAt(r.left + r.width / 2, r.top + r.height / 2, factor);
+}
+
+// Filename filter. Debounced by the caller, not here — this is also what Esc
+// and the persisted value go through, and those want to take effect at once.
+function setSearch(q) {
+  q = (q || "").trim().toLowerCase();
+  if (q === S.search) return;
+  S.search = q;
+  if ($("searchBox").value.trim().toLowerCase() !== q) $("searchBox").value = q;
+  localStorage.setItem("search", q);
+  applyFilter();
 }
 
 function cycleFilter() {
@@ -2564,6 +2990,7 @@ async function runExport() {
         dest,
         action: $("exAction").value,
         selection: $("exSel").value,
+        paths: $("exSel").value === "selected" ? selectionPaths() : null,
         min_rating: parseInt($("exMin").value, 10),
         keep_structure: $("exStruct").checked,
         compress: $("exCompress").checked,
@@ -2640,6 +3067,21 @@ function renderExFiles(verb, files, errors) {
 
 function rejectedCount() { return visiblePhotos().filter((p) => p.flag === -1).length; }
 
+// The selection holds one path per grid cell, but a cell can front a RAW+JPEG
+// pair. Every other bulk action expands the group before acting; an export that
+// didn't would quietly leave the negative behind while the RAW switches in the
+// dialog sat there looking like they applied.
+function selectionPaths() {
+  const out = [];
+  for (const pp of S.compare) {
+    const p = S.byPath.get(pp);
+    for (const m of (p && p.members && p.members.length ? p.members : [pp])) {
+      if (!out.includes(m)) out.push(m);
+    }
+  }
+  return out;
+}
+
 function defaultExportDest() {
   if (!S.folder) return "";
   const sep = S.folder.includes("\\") ? "\\" : "/";
@@ -2648,6 +3090,14 @@ function defaultExportDest() {
 
 function openExport() {
   if (!$("exDest").value.trim()) $("exDest").value = defaultExportDest();
+  // "the photos I picked" is only an option while there are some; when there
+  // are, it is usually the one that was meant, so it is pre-chosen
+  const selOpt = [...$("exSel").options].find((o) => o.value === "selected");
+  const picked = S.compare.length;
+  selOpt.textContent = picked ? `Selected in the grid (${picked})` : "Selected in the grid";
+  selOpt.disabled = !picked;
+  if (!picked && $("exSel").value === "selected") $("exSel").value = "keep";
+  else if (picked && !$("exSel").dataset.touched) $("exSel").value = "selected";
   const n = rejectedCount();
   const btn = $("delRejected");
   btn.textContent = `🗑 Delete rejected (${n})`;
@@ -2922,9 +3372,45 @@ function updateTreeOpenBtn() {
   $("treeOpenBtn").disabled = !treeState.selected;
 }
 
+// Keyboard driving for the tree: up/down move the highlight, right descends
+// into the highlighted folder, left goes back up, Enter opens it as the
+// library. Returns true when the key was ours, so the grid doesn't also act on
+// it. Before this the panel could only be used with the mouse.
+function treeKey(k) {
+  const rows = [...$("treeList").querySelectorAll(".tree-item[data-path]")];
+  if (!rows.length && k !== "arrowleft") return false;
+  const at = rows.findIndex((r) => r.classList.contains("selected"));
+  const go = (i) => {
+    const row = rows[Math.max(0, Math.min(rows.length - 1, i))];
+    if (row) { treeSelectItem(row.dataset.path, row); row.scrollIntoView({ block: "nearest" }); }
+  };
+  switch (k) {
+    case "arrowdown": case "d": go(at < 0 ? 0 : at + 1); return true;
+    case "arrowup": case "e": go(at < 0 ? 0 : at - 1); return true;
+    case "arrowright": case "f":
+      if (treeState.selected) treeNavigate(treeState.selected, null);
+      return true;
+    case "arrowleft": case "s":
+      treeNavigate(getParentPath(treeState.current || ""), treeState.current);
+      return true;
+    case "enter":
+      if (treeState.selected) { scanFolder(treeState.selected); treeClose(); }
+      return true;
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Wire up
 // ---------------------------------------------------------------------------
+// A clicked button keeps keyboard focus, so the next Space or Enter presses it
+// again instead of reaching the cull — click "Mouse" once and Space stops
+// selecting photos. Focus goes back to the page after every press. Modals are
+// left alone: tabbing through their fields is the one place it matters.
+document.addEventListener("click", (e) => {
+  const b = e.target.closest && e.target.closest("button");
+  if (b && !b.closest(".modal")) b.blur();
+});
 $("treeBtn").addEventListener("click", () => {
   if ($("treePanel").classList.contains("hidden")) treeOpen(); else treeClose();
 });
@@ -2946,14 +3432,54 @@ $("exBrowse").addEventListener("click", async () => {
 $("helpBtn").addEventListener("click", () => showModal("help"));
 $("mouseBtn").addEventListener("click", () => toggleMouseMode());
 $("helpClose").addEventListener("click", () => hideModal("help"));
-$("filterSel").addEventListener("change", (e) => { S.filter = e.target.value; applyFilter(); });
-$("typeSel").addEventListener("change", (e) => { S.typeFilter = e.target.value; applyFilter(); });
-$("sortSel").addEventListener("change", (e) => { S.sortKey = e.target.value; sortPhotos(); });
+$("filterSel").addEventListener("change", (e) => {
+  S.filter = e.target.value; localStorage.setItem("filter", S.filter); applyFilter();
+});
+$("typeSel").addEventListener("change", (e) => {
+  S.typeFilter = e.target.value; localStorage.setItem("typeFilter", S.typeFilter); applyFilter();
+});
+$("sortSel").addEventListener("change", (e) => {
+  S.sortKey = e.target.value; localStorage.setItem("sortKey", S.sortKey); sortPhotos();
+});
 $("sortDir").addEventListener("click", () => {
   S.sortDir = -S.sortDir;
+  localStorage.setItem("sortDir", String(S.sortDir));
   $("sortDir").textContent = S.sortDir === 1 ? "↑" : "↓";
+  $("sortDir").title = S.sortDir === 1 ? "Sort ascending — click for descending"
+                                       : "Sort descending — click for ascending";
   sortPhotos();
 });
+
+// ---- filename filter: keystrokes are debounced so a 3000-photo grid is not
+// rebuilt on every letter, but the value itself is written through at once ----
+let searchTimer = null;
+$("searchBox").addEventListener("input", (e) => {
+  clearTimeout(searchTimer);
+  const v = e.target.value;
+  searchTimer = setTimeout(() => setSearch(v), 140);
+});
+$("searchBox").addEventListener("search", (e) => setSearch(e.target.value));
+
+// ---- thumbnails: whole frame, or filled to the cell ----
+function applyFitMode() {
+  document.body.classList.toggle("fillthumbs", S.fillThumbs);
+  const b = $("fitBtn");
+  b.textContent = S.fillThumbs ? "▩ Fill" : "▣ Fit";
+  b.title = S.fillThumbs
+    ? "Thumbnails fill the cell (cropped) — click to show the whole frame"
+    : "Thumbnails show the whole frame — click to fill the cell";
+}
+$("fitBtn").addEventListener("click", () => {
+  S.fillThumbs = !S.fillThumbs;
+  localStorage.setItem("fillThumbs", S.fillThumbs ? "1" : "0");
+  applyFitMode();
+});
+
+// ---- loupe: edge chevrons, zoom toggle, filmstrip ----
+$("loupePrev").addEventListener("click", () => { if (S.viewer) loupeGo(S.viewer.cur - 1); });
+$("loupeNext").addEventListener("click", () => { if (S.viewer) loupeGo(S.viewer.cur + 1); });
+$("zoomFitBtn").addEventListener("click", () => zoomToggle());
+$("stripBtn").addEventListener("click", toggleFilmstrip);
 $("groupRaw").addEventListener("change", (e) => {
   S.groupRaw = e.target.checked;
   localStorage.setItem("groupRaw", S.groupRaw ? "1" : "0");
@@ -2978,6 +3504,8 @@ $("exRun").addEventListener("click", runExport);
   }
 })();
 
+// once the user picks a "which", stop second-guessing them on later opens
+$("exSel").addEventListener("change", () => { $("exSel").dataset.touched = "1"; });
 $("exCompress").addEventListener("change", (e) => {
   document.querySelector(".exq").classList.toggle("hidden", !e.target.checked);
 });
@@ -3123,7 +3651,8 @@ function applyGridSize(px) {
   $("groupRaw").checked = S.groupRaw;
 })();
 
-// ---- EXIF panel / alignment grid: on by default, persisted once toggled ----
+// ---- EXIF panel / alignment grid / filmstrip: on by default, persisted once
+// toggled ----
 (function initTogglePrefs() {
   const sm = localStorage.getItem("showMeta");
   if (sm !== null) S.showMeta = sm === "1";
@@ -3131,6 +3660,33 @@ function applyGridSize(px) {
   if (sg !== null) S.showGrid = sg === "1";
   const sh = localStorage.getItem("showHist");
   if (sh !== null) S.showHist = sh === "1";
+  const ss = localStorage.getItem("showStrip");
+  if (ss !== null) S.showStrip = ss === "1";
+})();
+
+// ---- how the grid is sorted, filtered and drawn is part of how someone works,
+// so it comes back with them rather than resetting to filename-descending every
+// time the app is opened ----
+(function initViewPrefs() {
+  const sk = localStorage.getItem("sortKey");
+  if (sk && [...$("sortSel").options].some((o) => o.value === sk)) {
+    S.sortKey = sk; $("sortSel").value = sk;
+  }
+  if (localStorage.getItem("sortDir") === "1") S.sortDir = 1;
+  $("sortDir").textContent = S.sortDir === 1 ? "↑" : "↓";
+  $("sortDir").title = S.sortDir === 1 ? "Sort ascending — click for descending"
+                                       : "Sort descending — click for ascending";
+  const f = localStorage.getItem("filter");
+  if (f && [...$("filterSel").options].some((o) => o.value === f)) {
+    S.filter = f; $("filterSel").value = f;
+  }
+  // the type filter is validated against the folder's actual extensions in
+  // populateTypeFilter(), so it is only seeded here
+  S.typeFilter = localStorage.getItem("typeFilter") || "all";
+  S.search = (localStorage.getItem("search") || "").trim().toLowerCase();
+  $("searchBox").value = S.search;
+  S.fillThumbs = localStorage.getItem("fillThumbs") === "1";
+  applyFitMode();
 })();
 
 // ---- slider tick marks: dense, evenly-spaced stops so dragging reads as a
