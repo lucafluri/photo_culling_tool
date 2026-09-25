@@ -45,7 +45,9 @@ and skips those formats.
 JPEG, PNG, WebP, TIFF, GIF, BMP, camera RAW (CR2/CR3, NEF, ARW, RAF, RW2, DNG,
 ORF and others) and HEIC/HEIF. Subfolders are optional. RAW decoding uses the
 embedded preview, which is why a 2000-photo RAW folder opens in seconds instead
-of minutes.
+of minutes; the preview is turned the way the RAW's own header says, so
+portrait RAWs come up upright. Capture times, camera and lens are read from
+RAW files too (from their TIFF container or their embedded preview).
 
 A RAW and a JPEG with the same base name collapse into one grid item tagged
 `JPG+RAW`. Marking, comparing, exporting and deleting then act on both files, so
@@ -53,8 +55,11 @@ the pair never drifts apart. Turn it off with the **group RAW+JPG** checkbox.
 
 ## Culling
 
-The grid lazy-loads cached thumbnails; the size slider is remembered between
-sessions. Sort by filename, date taken, date modified, size or rating, newest
+The grid lazy-loads cached thumbnails, and a background thread renders the rest
+ahead of you in the order the grid shows them. Thumbnails you fling past before
+they arrive are cancelled, so the ones on screen are never stuck behind them.
+JPEGs are decoded straight at reduced size, so a 24MP thumbnail costs a tenth
+of a full decode. The size slider is remembered between sessions. Sort by filename, date taken, date modified, size or rating, newest
 first by default. Filter down to keepers, rejects, unflagged or rated photos.
 The header counts how many photos are still unflagged ("N to cull").
 
@@ -116,8 +121,21 @@ image is used.
 falloff), film grain, and a solid border with width and color.
 
 Every slider has tick marks, a type-in numeric field, and resets on
-double-click. Sliders with a CSS equivalent preview live as you drag; the rest
-render a server draft on each pause, off a RAM-cached preview-size base.
+double-click. Tone and colour sliders (exposure, highlights, shadows, whites,
+blacks, contrast, brightness, white balance, saturation, sharpness) preview
+exactly as you drag: the server renders the picture once without them, and the
+browser applies the very lookup tables and blends the server will bake,
+computed from the same formulas and the picture's own histogram. The other
+sliders — and all of them once vibrance, clarity, noise reduction, vignette or
+grain are on — stream server drafts at the pane's size while you drag, one in
+flight at a time.
+
+What the loupe, the grid and the export show is the same pipeline. Previews and
+thumbnails are rendered from a base decoded no bigger than they need (bigger
+for a heavy crop, so it still shows full detail), and the filters that work in
+pixels — grain, sharpening, noise reduction — are sized relative to the frame,
+so a preview is the full-size export, downsized. The lens corrections,
+keystone, straighten and crop are one resampling, not four.
 
 The **Histogram** panel overlays the original's tone curve in white and lists
 every active adjustment. Each line in that list is a switch: click it to park
@@ -147,14 +165,15 @@ stays on it, **Save copy** bakes from it, and the Info panel reports the RAW's
 own dimensions and file size instead of the JPEG's. The switch is remembered
 between sessions.
 
-The first RAW preview costs a few seconds to demosaic and shows a spinner while
-it does; it is cached to disk, so every edit after that is immediate and
-re-opening the photo is instant. Compare and the tournament always use the fast
-embedded previews — a shortlist of twenty negatives is not worth demosaicing to
-pick a keeper.
+The first RAW preview is a half-size demosaic (a fraction of a second; the
+export does the full one) and shows a spinner while it runs; it is cached to
+disk, so every edit after that is immediate and re-opening the photo is
+instant. Compare, the tournament and the grid follow the same switch, so a
+photo looks the same wherever it is drawn.
 
 The file on disk is never rewritten, so **Reset** always gets you back to the
-original. Exporting bakes the edits into the output file. **Save copy** writes
+original. Exporting bakes the edits into the output file, keeping the EXIF and
+the colour profile. **Save copy** writes
 the edited version next to the original as `<name>_edited.jpg` and adds it to
 the library.
 
@@ -162,15 +181,18 @@ Rotating, flipping or straightening drops the crop, because the crop box is
 expressed in the rotated frame. Those, and any lens correction, also clear the
 retouch spots and say so: the spots sit on the finished frame, and moving the
 picture under them would heal the wrong pixels. Re-cropping is the exception —
-spots are remapped into the new frame instead.
+brush strokes and spots are remapped into the new frame instead. Switching a
+geometry change off in the histogram list parks the crop and strokes that sit
+on it, and switching it back on brings them back.
 
 ## Getting photos back out
 
 **Export** copies or moves kept, rejected or rated photos into a folder,
 defaulting to `<photo folder>/cull_output`, optionally keeping the subfolder
 structure. Edited photos are exported as JPEG with the crop, rotation and tone
-applied; everything else is copied byte for byte. Optionally re-encode JPEGs at
-a chosen quality on the way out, EXIF included.
+applied, EXIF and colour profile included; everything else is copied byte for
+byte. Optionally re-encode JPEGs at a chosen quality on the way out, EXIF
+included. Photos are exported by a few workers in parallel.
 
 When the library holds RAW files, the export dialog adds three switches, and
 they are independent — tick any combination:
@@ -193,7 +215,12 @@ Moving updates the marks to the new paths and rescans the folder, so nothing is
 lost.
 
 **Date split** moves or copies photos into subfolders named by date taken or
-date modified, either inside the current folder or somewhere you pick.
+date modified, either inside the current folder or somewhere you pick. A
+RAW+JPEG pair always lands in one folder, dated by whichever member knows when
+it was taken.
+
+With **subfolders** unticked, export, date split and delete act only on the
+photos the grid shows, not on subfolder photos from an earlier scan.
 
 **Delete rejected** opens a review grid of every rejected shot. Click a photo to
 spare it, then delete only what is still highlighted. Deletion goes to the
@@ -268,15 +295,13 @@ PHOTO_CULLER_HOME=/tmp/culler-scratch python app.py
 
 ## Known limitations
 
-- RAW orientation comes from the embedded preview's EXIF, so a RAW can
-  occasionally show up unrotated.
-- Grid thumbnails of a RAW always come from its embedded preview, so a folder
-  still opens in seconds. Only the loupe switches to the full decode, and only
-  when the export is set to render from the RAW.
-- Previews apply edits at 2400px while the export applies them at full size, so
-  filters measured in pixels rather than proportions — grain, sharpening, noise
-  reduction — come out slightly stronger in the preview.
-- Clarity, noise reduction and the lens corrections are full-frame filters, so
-  an export with those on costs a few seconds per photo at 24MP and up.
-- The server binds to 127.0.0.1 only and has no authentication, which is fine
-  for a local tool and not fine on a shared machine.
+- In RAW view the grid demosaics every RAW it shows (a fraction of a second
+  each, cached), so a RAW-only folder fills more slowly than in JPEG view.
+- While a tone slider moves, its preview is drawn over a JPEG of the picture
+  without it, so the pixels can differ by a level or two from the render that
+  replaces it on release — it is the same picture, a few JPEG artefacts apart.
+- An export with every filter on costs about 3 seconds per 24MP photo (spread
+  over a few workers); noise reduction and sharpening are the costly ones.
+- The server binds to 127.0.0.1, refuses requests for any other host name and
+  cross-site writes, and has no authentication — fine for a local tool, not
+  fine on a shared machine.

@@ -6,9 +6,10 @@ import os
 import tempfile
 import xml.dom.minidom
 
-from PIL import Image, ImageDraw
-from app import (_apply_edits, _bake_to_jpeg, _edits_tag, _find_paint_offset,
-                 _tone_lut, _write_xmp_sidecar, applied_edits)
+import numpy as np
+from PIL import Image, ImageCms, ImageDraw, ImageEnhance, ImageFilter, ImageOps
+from app import (_apply_edits, _bake_to_jpeg, _edits_tag, _find_paint_offset, _fit,
+                 _to_rgb, _tone_chain, _tone_lut, _write_xmp_sidecar, applied_edits)
 
 
 def test_apply_edits():
@@ -317,6 +318,87 @@ def test_bake_to_jpeg():
             assert im.size == (100, 100)     # 100x200 rotated frame, top half
 
 
+def _textured(w, h):
+    """A photo-like frame: smooth gradients with fine texture on top."""
+    y, x = np.mgrid[0:h, 0:w].astype(np.float32)
+    base = np.stack([120 + 80 * np.sin(x / w * 5), 110 + 70 * np.cos(y / h * 4),
+                     90 + 60 * np.sin((x + y) / (w + h) * 7)], axis=-1)
+    noise = np.random.default_rng(3).normal(0, 12, (h, w, 3))
+    return Image.fromarray(np.clip(base + noise, 0, 255).astype(np.uint8))
+
+
+def test_preview_matches_export():
+    # The loupe renders a downsized base with the pixel-sized filters scaled by
+    # `unit`; the export renders full size. Downsized to the preview's size,
+    # the export has to look like the preview — including grain, sharpening,
+    # noise reduction, and a straighten + crop (one resampling, fractional
+    # crop, so both frame the same window).
+    full = _textured(3600, 2400)
+    base = _fit(full, 1200)
+    blur = ImageFilter.GaussianBlur(2)
+    for e in ({"grain": 0.6}, {"sharpness": 2.5}, {"denoise": 0.8}, {"clarity": 0.8},
+              {"fine": 2, "crop": [0.1, 0.1, 0.9, 0.9], "distort": 0.1}):
+        prev = _apply_edits(base, e, 1200 / 2400.0)
+        exp = _fit(_apply_edits(full, e, 3600 / 2400.0), max(prev.size))
+        exp = exp.resize(prev.size, Image.LANCZOS) if exp.size != prev.size else exp
+        d = np.abs(np.asarray(prev.filter(blur), np.float32) -
+                   np.asarray(exp.filter(blur), np.float32)).mean()
+        assert d < 1.0, (e, d)
+
+
+def test_tone_chain_matches_steps():
+    # the fused lookup table does what the separate PIL steps did
+    im = _textured(300, 200)
+    e = {"exposure": 0.4, "shadows": 0.3, "wbR": 0.2, "wbB": -0.3, "bright": 1.1,
+         "contrast": 1.3}
+    step = im.point(_tone_lut(0.4, 0, 0.3, 0, 0) * 3)
+    r, g, b = step.split()
+    r = r.point(lambda v: min(255, int(v * 1.06)))
+    b = b.point(lambda v: min(255, int(v * 0.91)))
+    step = Image.merge("RGB", (r, g, b))
+    step = ImageEnhance.Brightness(step).enhance(1.1)
+    step = ImageEnhance.Contrast(step).enhance(1.3)
+    fused = _tone_chain(im, e)
+    diff = np.abs(np.asarray(fused, np.int16) - np.asarray(step, np.int16))
+    assert diff.max() <= 2 and diff.mean() < 0.2, (diff.max(), diff.mean())
+    # auto-levels in the chain, too
+    auto = _tone_chain(im, {"auto": True, "bright": 1.2})
+    ref = ImageEnhance.Brightness(ImageOps.autocontrast(im, cutoff=1)).enhance(1.2)
+    assert np.abs(np.asarray(auto, np.int16) - np.asarray(ref, np.int16)).max() <= 1
+
+
+def test_bake_keeps_metadata():
+    # EXIF and the colour profile survive an export — even through brightness
+    # and contrast, which used to hand back an image with neither
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in.jpg")
+        icc = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+        ex = Image.Exif()
+        ex[272] = "TestCam"
+        ex[0x0112] = 6                                   # stored sideways
+        ex[0x8769] = {36867: "2020:01:02 03:04:05"}
+        Image.new("RGB", (300, 200), (120, 90, 60)).save(src, icc_profile=icc, exif=ex.tobytes())
+        out = os.path.join(d, "out.jpg")
+        _bake_to_jpeg(src, out, {"bright": 1.3, "contrast": 1.2, "crop": [0, 0, 1, 0.5]}, 90)
+        with Image.open(out) as im:
+            got = im.getexif()
+            assert im.info.get("icc_profile") == icc
+            assert got.get(272) == "TestCam"
+            assert got.get_ifd(0x8769).get(36867) == "2020:01:02 03:04:05"
+            assert got.get(0x0112) is None            # baked into the pixels
+            assert im.size == (200, 150)              # upright 200x300, top half
+            assert (got.get_ifd(0x8769).get(0xA002), got.get_ifd(0x8769).get(0xA003)) == im.size
+
+
+def test_to_rgb():
+    # transparency lands on white, not on whatever colour sat under it
+    rgba = Image.new("RGBA", (4, 4), (255, 0, 0, 0))
+    assert _to_rgb(rgba).getpixel((1, 1)) == (255, 255, 255)
+    # 16-bit greyscale is scaled down, not clipped to white
+    deep = Image.new("I;16", (4, 4), 32768)
+    assert abs(_to_rgb(deep).getpixel((1, 1))[0] - 128) <= 1
+
+
 if __name__ == "__main__":
     test_apply_edits()
     test_tone_lut()
@@ -332,4 +414,8 @@ if __name__ == "__main__":
     test_applied_edits()
     test_xmp_sidecar()
     test_bake_to_jpeg()
+    test_preview_matches_export()
+    test_tone_chain_matches_steps()
+    test_bake_keeps_metadata()
+    test_to_rgb()
     print("ok")

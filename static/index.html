@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Photo Culler</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='3' width='14' height='11' rx='2' fill='%234a9eff'/%3E%3Ccircle cx='8' cy='8.5' r='3' fill='%23161616'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -19,7 +20,7 @@
     </div>
     <div class="right">
       <span id="counts" class="counts"></span>
-      <select id="filterSel" title="Filter (V)">
+      <select id="filterSel" title="Filter (T cycles)">
         <option value="all">All</option>
         <option value="keep">Keep</option>
         <option value="reject">Reject</option>
@@ -349,8 +350,10 @@
               Auto on, the histogram also estimates the Fuji WB shift (R/B)
               needed to match what Auto proposed</li>
             <li>every slider has tick marks and a type-in numeric field</li>
-            <li>sliders with a CSS equivalent preview as you drag; the rest
-              (highlights, lens, vignette…) render a server draft on each pause</li>
+            <li>tone and colour sliders preview exactly as you drag; lens,
+              vignette, grain and the rest stream server drafts while you drag.
+              Previews use the export's own pipeline, so what you see is what
+              gets written</li>
             <li>double-click a slider to reset it</li>
             <li><kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd> undo / redo (per photo)</li>
             <li><kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>Ctrl</kbd>+<kbd>V</kbd> copy / paste this photo's edits</li>
@@ -488,16 +491,23 @@
 
   <div id="toast" class="toast hidden"></div>
 
-  <!-- live-edit filters: exact white-balance matrix and PIL-equivalent sharpen
-       kernel, updated from the sliders while dragging -->
+  <!-- the live tone/colour preview while a slider moves: the server's own
+       lookup tables, saturation matrix, sharpening blend and B&W, filled in
+       by app.js (showLiveTone) -->
   <svg width="0" height="0" style="position:absolute" aria-hidden="true">
-    <filter id="liveWB" color-interpolation-filters="sRGB">
-      <feColorMatrix id="liveWBMat" type="matrix"
+    <filter id="liveFx" color-interpolation-filters="sRGB" x="0" y="0" width="1" height="1">
+      <feComponentTransfer result="tone">
+        <feFuncR id="liveR" type="table" tableValues="0 1" />
+        <feFuncG id="liveG" type="table" tableValues="0 1" />
+        <feFuncB id="liveB" type="table" tableValues="0 1" />
+      </feComponentTransfer>
+      <feColorMatrix id="liveSat" in="tone" type="matrix" result="sat"
         values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0" />
-    </filter>
-    <filter id="liveSharp" color-interpolation-filters="sRGB">
-      <feConvolveMatrix id="liveSharpMat" order="3" divisor="1"
-        preserveAlpha="true" kernelMatrix="0 0 0 0 1 0 0 0 0" />
+      <feGaussianBlur id="liveBlur" in="sat" stdDeviation="0" edgeMode="duplicate" result="blur" />
+      <feComposite id="liveSharp" in="sat" in2="blur" operator="arithmetic"
+        k1="0" k2="1" k3="0" k4="0" result="sharp" />
+      <feColorMatrix id="liveBw" in="sharp" type="matrix"
+        values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0" />
     </filter>
   </svg>
 

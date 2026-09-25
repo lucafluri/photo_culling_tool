@@ -62,11 +62,13 @@ async function api(path, opts) {
 const post = (path, body) =>
   api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
-// `_ev` (edit version) bumps when a photo's stored edits change, busting the
-// browser cache for its thumb/preview without touching the server cache key.
+// A thumbnail or preview URL names exactly one rendering: the file's mtime and
+// the server's tag for its stored edits. The server lets the browser keep such
+// a URL for good, so scrolling back up or reopening the app costs no requests —
+// and a changed edit stack is a new URL, never a stale cached picture.
 function verSuffix(path) {
   const x = S.byPath.get(path);
-  return x && x._ev ? "&v=" + x._ev : "";
+  return x ? "&t=" + (x.tag || "") + "&m=" + x.mtime : "";
 }
 // In RAW mode the thumbnail decodes the negative too (`full`): the embedded
 // preview is a camera JPEG, so without this the grid keeps showing the film
@@ -118,16 +120,115 @@ function syncSourceRow() {
   $("srcRawBtn").classList.toggle("active", S.previewSrc === "raw");
 }
 
-// Pass `editsObj` to render a live editor preview of those exact edits; omit it
-// to show the photo's stored edits.
-function previewUrl(p, editsObj) {
+// The photo's stored edits at preview size. Edit stacks that aren't stored
+// (or aren't yet) go through fetchRender instead.
+function previewUrl(p) {
   const raw = rawRenderPath(S.byPath.get(p));
   const target = raw || p;
   let u = "/api/preview?path=" + encodeURIComponent(target);
   if (raw) u += "&full=1";   // decode the negative, don't lift its preview
-  if (editsObj !== undefined) u += "&edits=" + encodeURIComponent(JSON.stringify(editsObj || {}));
-  else u += verSuffix(target);
-  return u;
+  return u + verSuffix(target);
+}
+
+// ---------------------------------------------------------------------------
+// Live renders: the editor posts the edit stack it wants to see and shows the
+// JPEG that comes back from a blob URL. A retouch history does not fit in a
+// query string, and a newer request aborts the one it supersedes instead of
+// queueing behind it — mid-drag, only the latest draft is worth downloading.
+// ---------------------------------------------------------------------------
+const PREVIEW_SIZE = 2400;
+const blobCache = new Map();   // request key -> {url, unit}, oldest first
+let paneAbort = null;
+
+async function fetchRender(path, edits, { size = PREVIEW_SIZE, pane = false } = {}) {
+  const raw = rawRenderPath(S.byPath.get(path));
+  const body = { path: raw || path, edits: edits || {}, full: !!raw,
+                 size: Math.min(PREVIEW_SIZE, Math.ceil(size / 100) * 100) };
+  const key = JSON.stringify(body);
+  const hit = blobCache.get(key);
+  if (hit) { blobCache.delete(key); blobCache.set(key, hit); return hit; }
+  let signal;
+  if (pane) {
+    if (paneAbort) paneAbort.abort();
+    paneAbort = new AbortController();
+    signal = paneAbort.signal;
+  }
+  const r = await fetch("/api/render", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: key, signal });
+  if (!r.ok) {
+    let msg = r.statusText;
+    try { msg = (await r.json()).detail || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+  const out = { url: URL.createObjectURL(await r.blob()),
+                unit: parseFloat(r.headers.get("X-Render-Unit")) || 0 };
+  blobCache.set(key, out);
+  // keep a handful (toggling original/edited, entering crop and leaving it);
+  // never revoke what the pane is showing
+  const shown = panesEl.children[0] && panesEl.children[0]._img &&
+                panesEl.children[0]._img.getAttribute("src");
+  for (const [k, v] of blobCache) {
+    if (blobCache.size <= 16) break;
+    if (v.url === shown || v === out) continue;
+    URL.revokeObjectURL(v.url);
+    blobCache.delete(k);
+  }
+  return out;
+}
+
+// the draft size worth rendering for the pane right now: its pixels, or the
+// full preview once zoomed in far enough to need it
+function paneDraftSize() {
+  const pane = panesEl.children[0];
+  if (!pane || !S.viewer) return PREVIEW_SIZE;
+  const px = Math.max(pane.clientWidth, pane.clientHeight) * (window.devicePixelRatio || 1);
+  return Math.min(PREVIEW_SIZE, Math.max(400, px * S.viewer.zoom));
+}
+
+// ---------------------------------------------------------------------------
+// Saves. Writes for one photo go out one at a time, and while one is in
+// flight only the newest waiting one is kept: fetches can land in any order,
+// and a quick undo right after a slider release used to leave the database
+// holding the older state (a flag and a quick re-flag, likewise). Each send
+// reads the photo's state when it goes out, so nothing is lost by skipping.
+// ---------------------------------------------------------------------------
+const saveQueues = new Map();
+function queueSave(key, send) {
+  let q = saveQueues.get(key);
+  if (!q) saveQueues.set(key, q = { busy: false, next: null, waiters: [] });
+  return new Promise((resolve, reject) => {
+    q.next = send;
+    q.waiters.push({ resolve, reject });
+    pumpSaves(key, q);
+  });
+}
+async function pumpSaves(key, q) {
+  if (q.busy || !q.next) return;
+  const send = q.next, waiters = q.waiters;
+  q.next = null; q.waiters = []; q.busy = true;
+  try {
+    const res = await send();
+    waiters.forEach((w) => w.resolve(res));
+  } catch (e) {
+    waiters.forEach((w) => w.reject(e));
+  } finally {
+    q.busy = false;
+    if (q.next) pumpSaves(key, q); else saveQueues.delete(key);
+  }
+}
+function saveMark(path) {
+  return queueSave("mark|" + path, () => {
+    const t = S.byPath.get(path);
+    return post("/api/mark", { path, flag: t ? t.flag : undefined, rating: t ? t.rating : undefined });
+  });
+}
+function saveEdits(path) {
+  return queueSave("edit|" + path, async () => {
+    const t = S.byPath.get(path);
+    const res = await post("/api/edit", { path, edits: t ? t.edits : null });
+    if (t && JSON.stringify(t.edits || null) === JSON.stringify(res.edits || null)) t.tag = res.tag;
+    return res;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -168,12 +269,13 @@ function typeGroup(ext) {
   return "std";
 }
 
-function ingest(photos) {
+function ingest(photos, keepPath) {
   // a fresh folder load starts with no carried-over compare selection, and no
   // mark-undo history pointing at the previous folder's photos
   S.compare = [];
   markHist.length = 0;
   S.cursor = 0;
+  S.view = [];
   S.photos = photos;
   S.byPath = new Map();
   for (const p of photos) {
@@ -184,6 +286,9 @@ function ingest(photos) {
   buildGroups();
   populateTypeFilter();
   sortPhotos();   // also calls applyFilter()
+  // a rescan (after an export, a split, ↻) keeps you on the photo you were at
+  const at = keepPath ? S.viewIdx.get(S.byPath.get(keepPath)) : undefined;
+  if (at !== undefined) setCursor(at, true);
 }
 
 // Base name (filename minus extension), lower-cased, for pairing.
@@ -301,10 +406,12 @@ function setFolderLabel(folder) {
 async function scanFolder(folder) {
   if (!folder) return;
   toast("Scanning…", 8000);
+  const cur = S.view[S.cursor];
+  const keep = cur && folder === S.folder ? cur.path : null;
   try {
     const res = await post("/api/open", { folder, recursive: $("recursive").checked });
     setFolderLabel(res.folder);
-    ingest(res.photos);
+    ingest(res.photos, keep);
     toast(res.photos.length + " images");
   } catch (e) { toast("Error: " + e.message, 4000); }
 }
@@ -368,10 +475,12 @@ function matches(p) {
 }
 function applyFilter() {
   S.view = S.photos.filter(matches);
+  S.viewIdx = new Map(S.view.map((p, i) => [p, i]));   // photo -> grid index
   S.cursor = Math.min(S.cursor, Math.max(0, S.view.length - 1));
   renderGrid();
   updateCounts();
 }
+const viewIndexOf = (p) => (S.viewIdx && S.viewIdx.has(p) ? S.viewIdx.get(p) : -1);
 
 function updateCounts() {
   let keep = 0, reject = 0, rated = 0;
@@ -393,19 +502,26 @@ function updateCounts() {
 // ---------------------------------------------------------------------------
 // Grid rendering (lazy thumbnails)
 // ---------------------------------------------------------------------------
+// Thumbnails load as they come near the viewport. One that scrolls back out
+// before it arrived has its request cancelled: the browser only runs six
+// requests at a time, so a fast fling through a big folder used to leave
+// hundreds of thumbnails you scrolled past queued ahead of the ones on screen
+// (and ahead of every mark you made meanwhile).
 let io = null;
 function ensureObserver() {
   if (io) return;
   io = new IntersectionObserver((entries) => {
     for (const e of entries) {
+      const img = e.target;
       if (e.isIntersecting) {
-        const img = e.target;
-        if (!img.src && img.dataset.src) img.src = img.dataset.src;
-        io.unobserve(img);
+        if (!img.getAttribute("src") && img.dataset.src) img.src = img.dataset.src;
+      } else if (img.getAttribute("src") && !img.complete) {
+        img.removeAttribute("src");
       }
     }
-  }, { root: grid, rootMargin: "400px" });
+  }, { root: grid, rootMargin: "600px 0px" });
 }
+let cellEls = [];   // grid index -> cell element
 
 function starStr(n) { return n > 0 ? "★".repeat(n) : ""; }
 
@@ -433,7 +549,10 @@ function typeBadge(p) {
 
 function renderGrid() {
   ensureObserver();
+  io.disconnect();          // the old cells are about to go; stop watching them
   grid.innerHTML = "";
+  cellEls = [];
+  S.hover = null;
   if (!S.view.length) {
     const d = document.createElement("div");
     d.className = "empty";
@@ -442,14 +561,15 @@ function renderGrid() {
     grid.appendChild(d);
     return;
   }
+  const cmpAt = new Map(S.compare.map((path, k) => [path, k]));
   const frag = document.createDocumentFragment();
   S.view.forEach((p, i) => {
     const cell = document.createElement("div");
     cell.className = cellClass(p);
     cell.dataset.i = i;
-    const cmpIdx = S.compare.indexOf(p.path);
+    const cmpIdx = cmpAt.has(p.path) ? cmpAt.get(p.path) : -1;
     cell.innerHTML =
-      `<img data-src="${thumbUrl(p.path)}" alt="" />` +
+      `<img data-src="${thumbUrl(p.path)}" alt="" decoding="async" />` +
       `<div class="name">${escapeHtml(p.filename)}</div>` +
       typeBadge(p) +
       (hasEdits(p) ? `<div class="editbadge" title="Edited">✎</div>` : "") +
@@ -457,21 +577,59 @@ function renderGrid() {
       `<div class="badges"><span class="flag"></span><span class="stars">${starStr(p.rating)}</span></div>`;
     if (i === S.cursor) cell.classList.add("sel");
     if (cmpIdx >= 0) cell.classList.add("cmp");
-    cell.addEventListener("click", () => { setCursor(i); });
-    cell.addEventListener("dblclick", () => openLoupe(i));
-    cell.addEventListener("mouseenter", () => { if (S.mouseMode) setHover(i); });
-    cell.addEventListener("mouseleave", () => { if (S.hover === i) setHover(null); });
+    cellEls[i] = cell;
     frag.appendChild(cell);
-    io.observe(cell.querySelector("img"));
+    io.observe(cell.firstChild);
   });
   grid.appendChild(frag);
-  const selCell = grid.querySelector(`.cell[data-i="${S.cursor}"]`);
+  const selCell = cellEls[S.cursor];
   if (selCell) scrollCellIntoView(selCell);
+  requestPrefetch();
+}
+
+// One set of listeners on the grid instead of four on every cell.
+const cellIndex = (el) => {
+  const c = el && el.closest ? el.closest(".cell") : null;
+  return c && c.parentElement === grid ? +c.dataset.i : null;
+};
+grid.addEventListener("click", (e) => {
+  const i = cellIndex(e.target);
+  if (i != null) setCursor(i);
+});
+grid.addEventListener("dblclick", (e) => {
+  const i = cellIndex(e.target);
+  if (i != null) openLoupe(i);
+});
+grid.addEventListener("mouseover", (e) => {
+  const i = cellIndex(e.target);
+  if (S.mouseMode && i != null && i !== S.hover) setHover(i);
+});
+grid.addEventListener("mouseout", (e) => {
+  const from = cellIndex(e.target), to = cellIndex(e.relatedTarget);
+  if (from != null && from !== to && S.hover === from) setHover(null);
+});
+// a thumbnail that arrived needs no more watching
+grid.addEventListener("load", (e) => { if (e.target.tagName === "IMG" && io) io.unobserve(e.target); }, true);
+
+// Tell the server which thumbnails the grid will want, in the order it shows
+// them from where you are, so a background thread renders ahead of the scroll.
+let prefetchTimer = null;
+function requestPrefetch() {
+  clearTimeout(prefetchTimer);
+  prefetchTimer = setTimeout(() => {
+    const from = Math.max(0, S.cursor - 20);
+    const order = S.view.slice(from).concat(S.view.slice(0, from));
+    const items = order.map((p) => {
+      const raw = rawRenderPath(p);
+      return [raw || p.path, raw ? 1 : 0];
+    });
+    if (items.length) post("/api/prefetch", { items }).catch(() => {});
+  }, 400);
 }
 
 // update a single cell in place (after marking) without full re-render
 function refreshCell(i) {
-  const cell = grid.querySelector(`.cell[data-i="${i}"]`);
+  const cell = cellEls[i];
   if (!cell) return;
   const p = S.view[i];
   // rebuilding className would drop the mouse-mode hover outline mid-cull
@@ -498,9 +656,9 @@ function setCursor(i, scroll = true) {
   i = Math.max(0, Math.min(S.view.length - 1, i));
   const prev = S.cursor;
   S.cursor = i;
-  const a = grid.querySelector(`.cell[data-i="${prev}"]`);
+  const a = cellEls[prev];
   if (a) a.classList.remove("sel");
-  const b = grid.querySelector(`.cell[data-i="${i}"]`);
+  const b = cellEls[i];
   if (b) { b.classList.add("sel"); if (scroll) scrollCellIntoView(b); }
 }
 
@@ -527,15 +685,9 @@ function columns() {
 
 function setHover(i) {
   const old = S.hover;
-  if (old != null) {
-    const c = grid.querySelector(`.cell[data-i="${old}"]`);
-    if (c) c.classList.remove("hover");
-  }
+  if (old != null && cellEls[old]) cellEls[old].classList.remove("hover");
   S.hover = i;
-  if (i != null && S.mouseMode) {
-    const c = grid.querySelector(`.cell[data-i="${i}"]`);
-    if (c) c.classList.add("hover");
-  }
+  if (i != null && S.mouseMode && cellEls[i]) cellEls[i].classList.add("hover");
 }
 
 function toggleMouseMode(on, quiet) {
@@ -578,10 +730,9 @@ function undoMark() {
     const t = S.byPath.get(it.path);
     if (!t) continue;
     t.flag = it.flag; t.rating = it.rating;
-    const vi = S.view.indexOf(t);
+    const vi = viewIndexOf(t);
     if (vi >= 0) refreshCell(vi);
-    post("/api/mark", { path: it.path, flag: it.flag, rating: it.rating })
-      .catch((e) => toast("Save failed: " + e.message));
+    saveMark(it.path).catch((e) => toast("Save failed: " + e.message));
   }
   updateCounts();
   if (S.viewer) renderViewerMeta();
@@ -602,13 +753,12 @@ async function mark(path, fields, record = true) {
     if (fields.rating !== undefined) t.rating = fields.rating;
   }
   // reflect in UI immediately
-  const vi = S.view.indexOf(p);
+  const vi = viewIndexOf(p);
   if (vi >= 0) refreshCell(vi);
   if (S.viewer) renderViewerMeta();
   updateCounts();
   try {
-    await Promise.all(targets.map((tp) =>
-      post("/api/mark", { path: tp, flag: fields.flag, rating: fields.rating })));
+    await Promise.all(targets.map((tp) => saveMark(tp)));
   } catch (e) { toast("Save failed: " + e.message); }
 }
 
@@ -651,10 +801,11 @@ function toggleCompare(path) {
   const i = S.compare.indexOf(path);
   if (i >= 0) S.compare.splice(i, 1);
   else { if (S.compare.length >= 16) { toast("Compare max 16"); return; } S.compare.push(path); }
-  const vi = S.view.findIndex((p) => p.path === path);
-  if (vi >= 0) refreshCell(vi);
-  // renumber others
-  S.view.forEach((p, idx) => { if (S.compare.includes(p.path)) refreshCell(idx); });
+  // this cell, and the others' numbers
+  for (const pp of [path].concat(S.compare)) {
+    const vi = viewIndexOf(S.byPath.get(pp));
+    if (vi >= 0) refreshCell(vi);
+  }
   updateCounts();
   updatePasteBtn();
 }
@@ -765,11 +916,24 @@ function paneList() {
   return v.paths;
 }
 
+// Everything that puts a picture in the loupe pane claims it first. A live
+// render still in flight for the previous state (or the previous photo) is
+// aborted, and if its answer arrives anyway it sees it no longer owns the
+// pane and drops it.
+let paneSeq = 0;
+let paneSettle = null;     // resolves the render that currently owns the pane
+function claimPane() {
+  if (paneAbort) { paneAbort.abort(); paneAbort = null; }
+  if (paneSettle) { const settle = paneSettle; paneSettle = null; settle(false); }
+  return ++paneSeq;
+}
+
 function buildPanes() {
   viewer.classList.remove("hidden");
   panesEl.innerHTML = "";
   const list = paneList();
   S.viewer._fit = [];
+  claimPane();
   list.forEach((path, idx) => {
     const pane = document.createElement("div");
     pane.className = "pane";
@@ -859,16 +1023,27 @@ function paneBusy(text) {
 // firing `onload`.
 function loadIntoPane(pane, url, done) {
   const img = pane._img;
+  const seq = claimPane();
   paneBusy(busyLabelFor(S.viewer.paths[S.viewer.cur]));
-  const finish = () => { paneBusy(null); done(); };
+  const finish = () => { if (seq !== paneSeq) return; paneBusy(null); done(); };
   img.onerror = () => paneBusy(null);
   img.onload = finish;
-  if (img.getAttribute("src") !== url) {
-    img.src = url;
-    if (img.complete && img.naturalWidth) finish();   // straight from cache
-  } else if (img.complete && img.naturalWidth) {
-    finish();
+  if (img.getAttribute("src") === url) {
+    if (img.complete && img.naturalWidth) finish();
+    return;
   }
+  swapWhenDecoded(img, url, seq);
+}
+
+// Put `url` into the pane's img only once it is decoded, so the old picture
+// stays up until the new one can be painted — swapping straight away showed
+// an empty pane for a frame or two on every render of a big image.
+function swapWhenDecoded(img, url, seq) {
+  const pre = new Image();
+  pre.src = url;
+  pre.decode().catch(() => {}).then(() => {
+    if (seq === paneSeq) img.src = url;   // fires load, cached or not
+  });
 }
 
 // what the loupe is about to wait for, in words. Keyed on the path rather than
@@ -879,6 +1054,7 @@ const busyLabelFor = (path) =>
     ? "Decoding negative…" : "Rendering…";
 
 function computeFit(idx, pane, img) {
+  if (!S.viewer) return;   // an image that finished loading after the viewer closed
   const PW = pane.clientWidth, PH = pane.clientHeight;
   const nw = img.naturalWidth, nh = img.naturalHeight;
   if (!nw || !nh) return;
@@ -911,9 +1087,13 @@ function applyTransform() {
     let scale = f.fit * v.zoom;
     const cx = f.PW / 2 + v.panx;
     const cy = f.PH / 2 + v.pany;
+    // a live border is drawn as an outline around the image; fit the whole
+    // bordered picture, as the baked render that replaces it will be
+    const lb = (idx === 0 && S.editor && S.editor.liveBorder) || 0;
+    if (lb) scale = v.zoom * Math.min(f.PW / (f.nw + 2 * lb), f.PH / (f.nh + 2 * lb));
     let rot = "";
     // live straighten: rotate + zoom to the inscribed rect while dragging
-    const lf = (idx === 0 && S.editor && S.editor.liveFine) ? S.editor.liveFine : 0;
+    const lf = (idx === 0 && S.editor && S.editor.liveFineReady) ? S.editor.liveFine : 0;
     if (lf) {
       const [wr, hr] = maxInscribed(f.nw, f.nh, lf);
       scale = v.zoom * Math.min(f.PW / wr, f.PH / hr);
@@ -1006,14 +1186,14 @@ function loupeGo(i) {
   v.zoom = 1; v.panx = 0; v.pany = 0;
   const pane = panesEl.children[0];
   const img = pane._img;
-  img.style.filter = ""; img.style.border = "";   // drop any live edit layers
+  clearLiveLayers(img);
   loadIntoPane(pane, previewUrl(v.paths[v.cur]), () => {
     computeFit(0, pane, img); applyTransform(); updateHud(); drawHistogram();
   });
   applyTransform();
   updateHud();
   // keep grid cursor in sync
-  const gi = S.view.findIndex((p) => p.path === v.paths[v.cur]);
+  const gi = viewIndexOf(S.byPath.get(v.paths[v.cur]));
   if (gi >= 0) setCursor(gi, true);
   if (S.editor) bindEditor(v.paths[v.cur]);   // editor follows the current photo
   renderViewerMeta();
@@ -1146,29 +1326,31 @@ function drawHistCurve(ctx, hist, w, h, color, fill) {
   }
 }
 
-// caches of per-photo stats computed from a fetched preview — the file's
-// pixels never change, so these are stable for the whole session; capped so
-// a long shoot doesn't grow them without bound
-const histCache = new Map();     // path -> {luma, means} of the ORIGINAL (edits={})
-const autoCache = new Map();     // path -> means of the AUTO-LEVELS-ONLY render
-function capCache(cache, path, val) {
-  cache.set(path, val);
+// caches of per-photo stats computed from a small render — the file's pixels
+// never change, so these are stable for the whole session; keyed by the file
+// actually rendered (JPEG or its negative, which look different) and capped
+// so a long shoot doesn't grow them without bound
+const histCache = new Map();     // file -> {luma, means} of the ORIGINAL (edits={})
+const autoCache = new Map();     // file -> means of the AUTO-LEVELS-ONLY render
+function capCache(cache, key, val) {
+  cache.set(key, val);
   if (cache.size > 50) cache.delete(cache.keys().next().value);
 }
-// fetch `previewUrl(path, edits)`, run `compute` on its sampled pixels, cache by path in `cache`
+// render `edits` at thumbnail size, run `compute` on its sampled pixels, cache it
 function statsFromPreview(cache, path, edits, compute) {
-  if (cache.has(path)) return Promise.resolve(cache.get(path));
-  return new Promise((resolve) => {
+  const key = (rawRenderPath(S.byPath.get(path)) || path) + "|" + S.previewSrc;
+  if (cache.has(key)) return Promise.resolve(cache.get(key));
+  return fetchRender(path, edits, { size: 480 }).then((r) => new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
       const pixels = sampleImageData(img);
       const val = pixels ? compute(pixels) : null;
-      capCache(cache, path, val);
+      capCache(cache, key, val);
       resolve(val);
     };
-    img.onerror = () => { capCache(cache, path, null); resolve(null); };
-    img.src = previewUrl(path, edits);
-  });
+    img.onerror = () => { capCache(cache, key, null); resolve(null); };
+    img.src = r.url;
+  }), () => null);
 }
 const getOrigStats = (path) =>
   statsFromPreview(histCache, path, {}, (px) => ({ luma: lumaHist(px), means: channelMeans(px) }));
@@ -1212,21 +1394,42 @@ function describeEdits(edits, disabled) {
   return out;
 }
 
+// What the positioned entries are positioned against. A crop is a box in the
+// rotated, straightened frame; retouch strokes sit on the finished, cropped
+// frame after the lens corrections. (Order matters: crop before spots.)
+const EDIT_DEPENDS = {
+  crop: ["rot", "flipH", "flipV", "fine"],
+  spots: ["rot", "flipH", "flipV", "fine", "distort", "ca", "persV", "persH", "crop"],
+};
+
 // Park one adjustment in `edits.off` (or bring it back) without disturbing the
-// rest — a per-change on/off switch, undoable like any other edit. Crop takes
-// the spots with it: they are positioned in the cropped frame, so leaving them
-// behind would heal the wrong pixels.
+// rest — a per-change on/off switch, undoable like any other edit.
+//
+// Geometry drags its dependents along: parking a rotation or a lens
+// correction parks the crop and the retouch strokes positioned on top of it
+// (they would otherwise heal the wrong pixels), and bringing it back brings
+// them back once everything they stand on is live again. A crop or stroke
+// made while the stage was parked belongs to a frame that is about to change,
+// so it goes — the same as when you rotate a cropped photo.
 function toggleEditKey(key) {
   const e = clone(curEdits());
   const off = clone(e.off || {});
-  const keys = key === "crop" ? ["crop", "spots"] : [key];
-  const disabling = e[key] !== undefined;
-  for (const k of keys) {
-    if (disabling) {
-      if (e[k] !== undefined) { off[k] = e[k]; delete e[k]; }
-    } else if (off[k] !== undefined) {
-      e[k] = off[k]; delete off[k];
+  const dependents = Object.keys(EDIT_DEPENDS).filter((d) => EDIT_DEPENDS[d].includes(key));
+  const park = (k) => { if (e[k] !== undefined) { off[k] = e[k]; delete e[k]; } };
+  const unpark = (k) => { if (off[k] !== undefined) { e[k] = off[k]; delete off[k]; } };
+  if (e[key] !== undefined) {
+    park(key);
+    dependents.forEach(park);
+  } else {
+    unpark(key);
+    (EDIT_DEPENDS[key] || []).forEach(unpark);    // what it stands on
+    const dropped = [];
+    for (const d of dependents) {
+      if (EDIT_DEPENDS[d].some((n) => off[n] !== undefined)) continue;
+      if (off[d] !== undefined) { e[d] = off[d]; delete off[d]; }
+      else if (e[d] !== undefined) { delete e[d]; dropped.push(d === "spots" ? "retouch" : d); }
     }
+    if (dropped.length) toast(`Geometry changed — ${dropped.join(" and ")} cleared`);
   }
   if (Object.keys(off).length) e.off = off; else delete e.off;
   pushEdit(e);
@@ -1323,6 +1526,10 @@ function updateHud() {
 
 function closeViewer() {
   paneBusy(null);
+  claimPane();       // nothing still in flight may land after the viewer is gone
+  endDrags();
+  paint = null; spotCursor = null; S.spotMode = false;
+  $("retouchBtn").classList.remove("active");
   S.viewer = null;
   S.editor = null; S.cropMode = false;
   const ov = document.getElementById("cropOverlay");
@@ -1365,6 +1572,7 @@ function bindEditor(path) {
   if (S.spotMode) exitRetouch(false);    // spots belong to the photo we're leaving
   if (!p._hist) { p._hist = [clone(p.edits)]; p._hidx = 0; }
   S.editor = { path, showOrig: false };
+  endDrags();
   $("editBar").classList.remove("hidden");
   syncEditControls();
   $("gridBtn").classList.toggle("active", S.showGrid);
@@ -1391,18 +1599,16 @@ async function commitEdit() {
   if (S.editor.showOrig) { S.editor.showOrig = false; $("origBtn").classList.remove("active"); }
   const edits = curEdits();
   p.edits = (edits && Object.keys(edits).length) ? clone(edits) : null;
-  p._ev = (p._ev || 0) + 1;   // bust browser cache for thumb/stored preview
   // the stack may have been replaced wholesale (preset, paste, reset, undo, a
   // parked change switched back on), so the panel is resynced on every commit —
   // for a slider-driven edit this just writes back what the slider already shows
   syncEditControls();
   renderEditPreview();
-  const vi = S.view.indexOf(p);
+  const vi = viewIndexOf(p);
   if (vi >= 0) refreshCell(vi);
   try {
-    await Promise.all(editTargets(p).map((tp) =>
-      post("/api/edit", { path: tp, edits: p.edits })));
-    refreshThumb(p);   // only after the server knows the new edits (avoids a stale fetch)
+    await Promise.all(editTargets(p).map((tp) => saveEdits(tp)));
+    refreshThumb(p);   // only after the server knows the new edits (and its tag)
   } catch (err) { toast("Edit save failed: " + err.message); }
 }
 
@@ -1418,37 +1624,39 @@ function editTargets(p) {
     if (!t || t === p) continue;
     t.edits = p.edits ? clone(p.edits) : null;
     t._hist = null; t._hidx = 0;    // its own history would now be a lie
-    t._ev = (t._ev || 0) + 1;
   }
   return paths;
 }
 
 // re-fetch a photo's grid thumbnail after its stored edits changed
 function refreshThumb(p) {
-  const vi = S.view.indexOf(p);
-  if (vi < 0) return;
-  setThumbSrc(grid.querySelector(`.cell[data-i="${vi}"] img`), p);
+  const vi = viewIndexOf(p);
+  if (vi >= 0 && cellEls[vi]) setThumbSrc(cellEls[vi].firstChild, p);
 }
 
 // same, for every visible cell — the JPEG/RAW switch repoints all of them
 function refreshThumbs() {
-  grid.querySelectorAll(".cell img").forEach((img) =>
-    setThumbSrc(img, S.view[+img.parentElement.dataset.i]));
+  cellEls.forEach((cell, i) => setThumbSrc(cell.firstChild, S.view[i]));
+  requestPrefetch();
 }
 
 function setThumbSrc(img, p) {
   if (!img || !p) return;
   const u = thumbUrl(p.path);
-  if (img.src) img.src = u;
-  else img.dataset.src = u;   // not lazily loaded yet
+  img.dataset.src = u;
+  if (img.getAttribute("src")) img.src = u;   // else it loads when scrolled to
 }
 
-// server render of the edits dict into the pane. Live CSS layers (filter,
-// border, straighten transform) stay up until the baked image arrives, so
-// there's no flash back to the unedited base.
-function renderEditPreview(overrideEdits, keepLive) {
+// Server render of an edit stack into the pane. Live layers (the tone filter,
+// the border outline, the straighten transform) stay up until the render
+// arrives, so there's no flash back to the unedited base; `keepLive` leaves
+// them up after it too, because a drag is still going on top of it.
+// `size` asks for a smaller draft; `onReady` runs once it is on screen. The
+// promise settles either way: true once shown, false if it failed or was
+// superseded.
+function renderEditPreview(overrideEdits, keepLive, { size, onReady } = {}) {
   const pane = panesEl.children[0];
-  if (!pane || !S.editor) return;
+  if (!pane || !S.editor) return Promise.resolve(false);
   const img = pane._img;
   let edits = overrideEdits !== undefined ? overrideEdits : curEdits();
   // spots are normalized against the un-bordered frame — the same one the
@@ -1457,23 +1665,41 @@ function renderEditPreview(overrideEdits, keepLive) {
     edits = clone(edits);
     delete edits.border;
   }
-  const url = previewUrl(S.editor.path, edits);
-  paneBusy(busyLabelFor(S.editor.path));
-  img.onerror = () => paneBusy(null);
-  img.onload = () => {
-    paneBusy(null);
-    if (!keepLive) {   // keepLive: a drag is in progress, its live layer stays
-      img.style.filter = ""; img.style.border = "";
-      if (S.editor) S.editor.liveFine = 0;
-      drawHistogram();
-    }
-    computeFit(0, pane, img); applyTransform(); updateHud();
-  };
-  if (img.getAttribute("src") === url) {
-    if (img.complete && img.naturalWidth) img.onload();
-  } else {
-    img.src = url;
-  }
+  const path = S.editor.path;
+  const seq = claimPane();
+  paneBusy(busyLabelFor(path));
+  return new Promise((settle) => {
+    paneSettle = settle;
+    const done = (ok) => { if (paneSettle === settle) paneSettle = null; settle(ok); };
+    fetchRender(path, edits, { size: size || PREVIEW_SIZE, pane: true }).then((r) => {
+      if (seq !== paneSeq || !S.editor || S.editor.path !== path) return done(false);
+      img.onerror = () => { paneBusy(null); done(false); };
+      img.onload = () => {
+        if (seq !== paneSeq) return done(false);
+        paneBusy(null);
+        if (S.editor) S.editor.unit = r.unit || 0;
+        if (!keepLive) clearLiveLayers(img);
+        computeFit(0, pane, img); applyTransform(); updateHud();
+        if (!keepLive) drawHistogram();
+        if (onReady) onReady();
+        done(true);
+      };
+      if (img.getAttribute("src") === r.url && img.complete && img.naturalWidth) img.onload();
+      else swapWhenDecoded(img, r.url, seq);
+    }, (err) => {
+      if (seq === paneSeq) {
+        paneBusy(null);
+        if (err.name !== "AbortError") toast("Render failed: " + err.message, 3000);
+      }
+      done(false);
+    });
+  });
+}
+
+// drop whatever a drag drew over the image itself
+function clearLiveLayers(img) {
+  img.style.filter = ""; img.style.outline = "";
+  if (S.editor) { S.editor.liveFine = 0; S.editor.liveFineReady = false; S.editor.liveBorder = 0; }
 }
 
 // flip the loupe between the untouched original and the edited version
@@ -1641,15 +1867,13 @@ async function applyEditsToSelection(edits, label) {
     p._hist.push(clone(edits));
     p._hidx = p._hist.length - 1;
     p.edits = (edits && Object.keys(edits).length) ? clone(edits) : null;
-    p._ev = (p._ev || 0) + 1;
-    const vi = S.view.indexOf(p);
+    const vi = viewIndexOf(p);
     if (vi >= 0) refreshCell(vi);
   }
   const n = targets.length;
   try {
     const all = [].concat(...targets.map((path) => editTargets(S.byPath.get(path))));
-    await Promise.all(all.map((path) =>
-      post("/api/edit", { path, edits: S.byPath.get(path).edits })));
+    await Promise.all(all.map((path) => saveEdits(path)));
     targets.forEach((path) => refreshThumb(S.byPath.get(path)));
     toast(`Applied ${label} to ${n} photo${n === 1 ? "" : "s"}`);
   } catch (e) { toast("Save failed: " + e.message); }
@@ -1726,9 +1950,19 @@ function applyPresetToSelection() {
   $("presetGridSel").value = "";
 }
 
+// ---- drags ----
+let fineDragging = false, borderDragging = false;
+// A drag abandoned half way (the photo changed under it, the viewer closed)
+// must not leave its state behind: the next drag would skip rendering its
+// base and draw its live layer over an already-edited picture.
+function endDrags() {
+  fineDragging = borderDragging = false;
+  draftNext = null;
+  if (S.editor) { S.editor.live = null; S.editor.liveFineReady = false; }
+}
+
 // ---- fine rotation (straighten): live rotate+zoom while dragging, exact
 // server render (auto-cropped to the inscribed rect) on release ----
-let fineDragging = false;
 function fineInput() {
   $("fineRNum").value = Math.round(parseFloat($("fineR").value) * 10) / 10;
   if (!S.editor) return;
@@ -1736,10 +1970,16 @@ function fineInput() {
     fineDragging = true;
     syncGridOverlay();   // force the alignment grid on for this drag
     // base for the live transform: current edits minus fine/crop/border —
-    // the same frame the server rotates before those steps
+    // the same frame the server rotates before those steps. The retouch
+    // strokes go too: they sit on the cropped frame, and this one isn't.
     const base = clone(curEdits());
-    delete base.fine; delete base.crop; delete base.border;
-    renderEditPreview(base, true);
+    delete base.fine; delete base.crop; delete base.border; delete base.spots;
+    S.editor.liveFineReady = false;   // don't tilt the old picture meanwhile
+    renderEditPreview(base, true, { size: paneDraftSize(), onReady: () => {
+      if (!S.editor || !fineDragging) return;
+      S.editor.liveFineReady = true;
+      applyTransform();
+    } });
   }
   S.editor.liveFine = parseFloat($("fineR").value) || 0;
   applyTransform();
@@ -1759,27 +1999,35 @@ function fineCommit() {
   $("fineR").blur(); $("fineRNum").blur();
 }
 
-// ---- border: live CSS border while dragging, server-baked on release ----
-let borderDragging = false;
+// ---- border: an outline while dragging, server-baked on release ----
 function borderInput() {
   $("borderWNum").value = Math.round(parseFloat($("borderW").value) * 1000) / 10;
   if (!S.editor) return;
   if (!borderDragging) {
     borderDragging = true;
-    // drop the baked border so the live CSS border isn't doubled
+    // drop the baked border so the live one isn't doubled
     const base = clone(curEdits());
     delete base.border;
-    renderEditPreview(base, true);
+    S.editor.borderReady = false;
+    renderEditPreview(base, true, { onReady: () => {
+      if (!S.editor) return;
+      S.editor.borderReady = true;
+      showLiveBorder(parseFloat($("borderW").value), $("borderC").value);
+    } });
+    return;
   }
-  applyLiveBorder();
+  if (S.editor.borderReady) showLiveBorder(parseFloat($("borderW").value), $("borderC").value);
 }
-function applyLiveBorder() {
+// The border as an outline around the image, at the width the server will
+// add (a fraction of the short edge), and fitted as the bordered render will be.
+function showLiveBorder(w, color) {
   const pane = panesEl.children[0];
   const f = S.viewer && S.viewer._fit[0];
-  if (!pane || !f) return;
-  const w = parseFloat($("borderW").value);
-  const px = Math.round(w * Math.min(f.nw, f.nh));
-  pane._img.style.border = px > 0 ? `${px}px solid ${$("borderC").value}` : "";
+  if (!pane || !f || !S.editor) return;
+  const px = w > 0 ? Math.round(w * Math.min(f.nw, f.nh)) : 0;
+  pane._img.style.outline = px > 0 ? `${px}px solid ${color || "#ffffff"}` : "";
+  S.editor.liveBorder = px;
+  applyTransform();
 }
 function borderCommit() {
   borderDragging = false;
@@ -1799,29 +2047,25 @@ function borderCommit() {
   $("borderW").blur(); $("borderC").blur();
 }
 
-// ---- tonal sliders: live preview while dragging, bake on release ----
-// bright/contrast/saturation map to CSS filters; wbR/wbB are an exact
-// feColorMatrix (same independent R/B gains as the server); sharpness is an
-// feConvolveMatrix built from the same blend PIL uses (identity·v + SMOOTH·(1-v)).
+// ---- tonal sliders ----
 // Every tonal/lens slider in one table, and the sidebar rows are generated
 // from it — a new adjustment is one row here, not a block of markup plus four
 // places that have to learn its name.
-//   live "css": previewable with a CSS/SVG filter while dragging (exact or
-//               near enough that the server render doesn't visibly jump)
-//   live "srv": no CSS equivalent — the server renders a draft while dragging
+//   live "css": previewed exactly by an SVG filter while dragging (see below)
+//   live "srv": no filter equivalent — the server renders drafts while dragging
 const SLIDER_DEFS = [
   // group,     key,          label,               min,  max, step, neutral, live, ticks
   ["lens",    "distort",   "\u{1F6E2} Distortion",   -0.5,  0.5, 0.01, 0, "srv", 11],
   ["lens",    "ca",        "\u{1F308} Chromatic ab.",  -1,    1, 0.02, 0, "srv", 11],
-  ["lens",    "persV",     "\u2195 Perspective V",     -1,    1, 0.02, 0, "srv", 11],
-  ["lens",    "persH",     "\u2194 Perspective H",     -1,    1, 0.02, 0, "srv", 11],
+  ["lens",    "persV",     "↕ Perspective V",     -1,    1, 0.02, 0, "srv", 11],
+  ["lens",    "persH",     "↔ Perspective H",     -1,    1, 0.02, 0, "srv", 11],
 
-  ["light",   "exposure",  "\u2600 Exposure",          -3,    3, 0.05, 0, "css", 13],
-  ["light",   "contrast",  "\u25D0 Contrast",         0.2,    2, 0.02, 1, "css", 10],
-  ["light",   "highlights","\u25B2 Highlights",        -1,    1, 0.02, 0, "srv", 11],
-  ["light",   "shadows",   "\u25BC Shadows",           -1,    1, 0.02, 0, "srv", 11],
-  ["light",   "whites",    "\u25A1 Whites",            -1,    1, 0.02, 0, "srv", 11],
-  ["light",   "blacks",    "\u25A0 Blacks",            -1,    1, 0.02, 0, "srv", 11],
+  ["light",   "exposure",  "☀ Exposure",          -3,    3, 0.05, 0, "css", 13],
+  ["light",   "contrast",  "◐ Contrast",         0.2,    2, 0.02, 1, "css", 10],
+  ["light",   "highlights","▲ Highlights",        -1,    1, 0.02, 0, "css", 11],
+  ["light",   "shadows",   "▼ Shadows",           -1,    1, 0.02, 0, "css", 11],
+  ["light",   "whites",    "□ Whites",            -1,    1, 0.02, 0, "css", 11],
+  ["light",   "blacks",    "■ Blacks",            -1,    1, 0.02, 0, "css", 11],
   ["light",   "bright",    "\u{1F506} Brightness",    0.2,    2, 0.02, 1, "css", 10],
 
   ["color",   "wbR",       "\u{1F534} WB Red",         -1,    1, 0.02, 0, "css", 11],
@@ -1829,19 +2073,18 @@ const SLIDER_DEFS = [
   ["color",   "vibrance",  "\u{1F321} Vibrance",       -1,    1, 0.02, 0, "srv", 11],
   ["color",   "saturation","\u{1F3A8} Saturation",      0,    2, 0.02, 1, "css", 11],
 
-  ["detail",  "clarity",   "\u25CE Clarity",           -1,    1, 0.02, 0, "srv", 11],
+  ["detail",  "clarity",   "◎ Clarity",           -1,    1, 0.02, 0, "srv", 11],
   ["detail",  "sharpness", "\u{1F52A} Sharpness",       0,    3, 0.05, 1, "css", 13],
-  ["detail",  "denoise",   "\u224B Noise reduction",    0,    1, 0.02, 0, "srv", 11],
+  ["detail",  "denoise",   "≋ Noise reduction",    0,    1, 0.02, 0, "srv", 11],
 
-  ["effects", "vignette",  "\u25CD Vignette",          -1,    1, 0.02, 0, "srv", 11],
-  ["effects", "grain",     "\u25A8 Grain",              0,    1, 0.02, 0, "srv", 11],
+  ["effects", "vignette",  "◍ Vignette",          -1,    1, 0.02, 0, "srv", 11],
+  ["effects", "grain",     "▨ Grain",              0,    1, 0.02, 0, "srv", 11],
 ];
 const SLIDER_INFO = {};
 SLIDER_DEFS.forEach((d) => {
   SLIDER_INFO[d[1]] = { group: d[0], key: d[1], label: d[2], min: d[3], max: d[4],
                         step: d[5], neutral: d[6], live: d[7], ticks: d[8] };
 });
-const LIVE_KEYS = SLIDER_DEFS.filter((d) => d[7] === "css").map((d) => d[1]);
 const ALL_SLIDER_KEYS = SLIDER_DEFS.map((d) => d[1]);
 const neutralOf = (k) => (SLIDER_INFO[k] ? SLIDER_INFO[k].neutral : 0);
 
@@ -1863,40 +2106,130 @@ function buildSliders() {
 }
 buildSliders();
 
-let sliderDragging = false;
+// ---- exact live preview ----
+// Tone and colour sliders preview exactly while they move. The server renders
+// the picture once without them — geometry, retouch, everything that comes
+// before them in the pipeline — and an SVG filter on top applies the very
+// lookup table, colour matrix and blends the server will bake, computed here
+// from the same formulas and the picture's own histogram (auto-levels and the
+// contrast pivot depend on it). They used to be CSS brightness()/contrast()
+// stand-ins that visibly jumped when the real render arrived.
+//
+// The stages after them that don't commute (vibrance, clarity, noise
+// reduction, vignette, grain) can't be stacked on top that way. With any of
+// those on, every slider previews through server drafts instead — exact too,
+// just paced by the server.
+const LIVE_KEYS = ["exposure", "highlights", "shadows", "whites", "blacks", "auto",
+                   "temp", "wbR", "wbB", "bright", "contrast", "saturation", "sharpness", "bw"];
+const POST_KEYS = ["vibrance", "clarity", "denoise", "vignette", "grain"];
+const liveExact = (e) => !POST_KEYS.some((k) => e[k]);
 
-// the edit stack minus everything the live CSS filter is about to stand in for
-function geomEdits() {
-  const e = clone(curEdits());
-  for (const k of LIVE_KEYS) delete e[k];
-  return e;
-}
-function sliderVal(k) {
-  const inp = $("editBar").querySelector(`input[data-edit="${k}"]`);
-  return inp ? parseFloat(inp.value) : neutralOf(k);
-}
-function liveFilter() {
-  const parts = [];
-  const wr = sliderVal("wbR"), wb = sliderVal("wbB");
-  if (wr || wb) {
-    $("liveWBMat").setAttribute("values",
-      `${1 + 0.3 * wr} 0 0 0 0  0 1 0 0 0  0 0 ${1 + 0.3 * wb} 0 0  0 0 0 1 0`);
-    parts.push("url(#liveWB)");
+// JS twin of the server's _tone_lut
+function toneLut(ex, hi, sh, wh, bl) {
+  const lut = new Array(256);
+  for (let i = 0; i < 256; i++) {
+    let v = i / 255;
+    if (ex) {
+      let lin = v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+      lin = Math.min(1, Math.max(0, lin * Math.pow(2, ex)));
+      v = lin <= 0.0031308 ? lin * 12.92 : 1.055 * Math.pow(lin, 1 / 2.4) - 0.055;
+    }
+    const v0 = v;
+    let out = v;
+    if (sh) out += 0.40 * sh * 4.0 * v0 * (1 - v0) ** 2;
+    if (hi) out += 0.40 * hi * 4.0 * (1 - v0) * v0 ** 2;
+    if (bl) out += 0.25 * bl * (1 - v0) ** 2;
+    if (wh) out += 0.25 * wh * v0 ** 2;
+    lut[i] = Math.round(Math.min(1, Math.max(0, out)) * 255);
   }
-  // exposure is a linear-light multiply on the server and a plain gain here;
-  // close enough over a drag that the baked render doesn't visibly jump
-  const gain = Math.pow(2, sliderVal("exposure")) * sliderVal("bright");
-  parts.push(`brightness(${gain.toFixed(4)}) contrast(${sliderVal("contrast")}) ` +
-             `saturate(${sliderVal("saturation")})`);
-  const s = sliderVal("sharpness");
-  if (Math.abs(s - 1) > 1e-6) {
-    const e = (1 - s) / 13, c = s + 5 * (1 - s) / 13;
-    $("liveSharpMat").setAttribute("kernelMatrix",
-      `${e} ${e} ${e} ${e} ${c} ${e} ${e} ${e} ${e}`);
-    parts.push("url(#liveSharp)");
-  }
-  return parts.join(" ");
+  return lut;
 }
+
+// JS twin of PIL's ImageOps.autocontrast(cutoff=1) for one channel's histogram
+function autoLevelsLut(hist) {
+  const h = Array.from(hist);
+  let n = 0;
+  for (let i = 0; i < 256; i++) n += h[i];
+  for (const dir of [1, -1]) {           // shave 1% off each end
+    let cut = Math.floor(n / 100);
+    for (let i = dir > 0 ? 0 : 255; i >= 0 && i < 256 && cut > 0; i += dir) {
+      if (cut > h[i]) { cut -= h[i]; h[i] = 0; } else { h[i] -= cut; cut = 0; }
+    }
+  }
+  let lo = 0, hi = 255;
+  while (lo < 255 && !h[lo]) lo++;
+  while (hi > 0 && !h[hi]) hi--;
+  const lut = new Array(256);
+  if (hi <= lo) { for (let i = 0; i < 256; i++) lut[i] = i; return lut; }
+  const scale = 255 / (hi - lo), offset = -lo * scale;
+  for (let i = 0; i < 256; i++) lut[i] = Math.max(0, Math.min(255, Math.trunc(i * scale + offset)));
+  return lut;
+}
+
+// JS twin of the server's _tone_chain: the three 256-entry tables it bakes,
+// for a picture with channel histograms `hist` ([r, g, b]).
+function toneTables(e, hist) {
+  const num = (k, d) => (e[k] != null ? +e[k] : d);
+  let base = Array.from({ length: 256 }, (_, i) => i);
+  if (num("exposure", 0) || num("highlights", 0) || num("shadows", 0) ||
+      num("whites", 0) || num("blacks", 0)) {
+    base = toneLut(num("exposure", 0), num("highlights", 0), num("shadows", 0),
+                   num("whites", 0), num("blacks", 0));
+  }
+  let chans = [base, base, base];
+  if (e.auto) {
+    chans = [0, 1, 2].map((c) => {
+      const after = new Float64Array(256);
+      for (let i = 0; i < 256; i++) after[base[i]] += hist[c][i];
+      const a = autoLevelsLut(after);
+      return base.map((v) => a[v]);
+    });
+  }
+  const temp = num("temp", 0);
+  const gains = [1 + 0.3 * (temp + num("wbR", 0)), 1, 1 + 0.3 * (-temp + num("wbB", 0))];
+  const bright = num("bright", 1), contrast = num("contrast", 1);
+  const clip8 = (v) => (v <= 0 ? 0 : v >= 255 ? 255 : Math.trunc(v));
+  chans = chans.map((t, c) => t.map((v) => {
+    let x = gains[c] !== 1 ? Math.min(255, Math.trunc(v * gains[c])) : v;
+    if (bright !== 1) x = clip8(x * bright);
+    return x;
+  }));
+  if (contrast !== 1) {
+    const means = [0, 1, 2].map((c) => {
+      let s = 0, n = 0;
+      for (let i = 0; i < 256; i++) { s += hist[c][i] * chans[c][i]; n += hist[c][i]; }
+      return n ? s / n : 0;
+    });
+    const mean = Math.trunc(0.299 * means[0] + 0.587 * means[1] + 0.114 * means[2] + 0.5);
+    chans = chans.map((t) => t.map((v) => clip8(mean + contrast * v - contrast * mean)));
+  }
+  return chans;
+}
+
+// Point the #liveFx filter at edit stack `e` and put it on `img`.
+function showLiveTone(img, e, hist) {
+  const [r, g, b] = toneTables(e, hist);
+  const tv = (t) => t.map((v) => (v / 255).toFixed(4)).join(" ");
+  $("liveR").setAttribute("tableValues", tv(r));
+  $("liveG").setAttribute("tableValues", tv(g));
+  $("liveB").setAttribute("tableValues", tv(b));
+  // saturation: PIL blends with its own greyscale (Rec. 601 weights)
+  const s = e.saturation != null ? +e.saturation : 1, k = 1 - s;
+  const L = [0.299, 0.587, 0.114];
+  const row = (c) => L.map((w, j) => (w * k + (j === c ? s : 0)).toFixed(5)).join(" ") + " 0 0";
+  $("liveSat").setAttribute("values", `${row(0)}  ${row(1)}  ${row(2)}  0 0 0 1 0`);
+  // sharpness: a blend with a gaussian sized as the server sizes it
+  const v = e.sharpness != null ? +e.sharpness : 1;
+  const unit = S.editor.unit || Math.min(1, Math.max(img.naturalWidth, img.naturalHeight) / PREVIEW_SIZE);
+  $("liveBlur").setAttribute("stdDeviation", v !== 1 ? (0.68 * unit).toFixed(3) : "0");
+  $("liveSharp").setAttribute("k2", v);
+  $("liveSharp").setAttribute("k3", 1 - v);
+  const bw = e.bw ? `${L.join(" ")} 0 0` : null;
+  $("liveBw").setAttribute("values", bw ? `${bw}  ${bw}  ${bw}  0 0 0 1 0`
+                                        : "1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0");
+  img.style.filter = "url(#liveFx)";
+}
+
 // Retouch spots are positioned on the final frame, so anything upstream that
 // moves pixels (rotate, straighten, lens correction) leaves them healing the
 // wrong place. Crop is remapped instead (remapSpots); the rest drop the spots,
@@ -1904,7 +2237,7 @@ function liveFilter() {
 function dropSpots(next, prev) {
   if (!prev || !prev.spots || !prev.spots.length) return next;
   delete next.spots;
-  toast("Geometry changed \u2014 retouch spots cleared");
+  toast("Geometry changed — retouch spots cleared");
   return next;
 }
 
@@ -1920,16 +2253,23 @@ function editsWith(inp, announce) {
   return n;
 }
 
-// Sliders with no CSS equivalent (highlights/shadows, lens, vignette, grain…)
-// preview by asking the server for a draft render, debounced to one in flight
-// per pause. The draft comes off the RAM-cached 2400px base, so it lands in
-// well under the time it takes to move to the next slider.
-let srvTimer = null;
-function srvSliderInput(inp) {
-  if (!S.editor) return;
-  const n = editsWith(inp);
-  clearTimeout(srvTimer);
-  srvTimer = setTimeout(() => { if (S.editor) renderEditPreview(n); }, 130);
+// Server drafts while a slider moves: one render in flight at a time, and the
+// next one asked for as soon as it lands — with only the newest position
+// waiting in between. The pane keeps up with the drag at whatever pace the
+// server manages, rather than showing nothing until the mouse pauses.
+let draftBusy = false, draftNext = null;
+function requestDraft(edits) {
+  draftNext = edits;
+  if (draftBusy) return;
+  draftBusy = true;
+  (async () => {
+    while (draftNext && S.editor) {
+      const e = draftNext;
+      draftNext = null;
+      await renderEditPreview(e, false, { size: paneDraftSize() });
+    }
+    draftBusy = false;
+  })();
 }
 
 function sliderInput(inp) {
@@ -1938,19 +2278,51 @@ function sliderInput(inp) {
   const pane = panesEl.children[0];
   if (!pane || !S.editor) return;
   const def = SLIDER_INFO[inp.dataset.edit];
-  if (def && def.live === "srv") { srvSliderInput(inp); return; }
-  // first move: drop the baked-in tonal layer so the live filter isn't doubled
-  if (!sliderDragging) { sliderDragging = true; renderEditPreview(geomEdits(), true); }
-  pane._img.style.filter = liveFilter();
+  const next = editsWith(inp);
+  if (!def || def.live !== "css" || !liveExact(next)) {
+    S.editor.live = null;
+    requestDraft(next);
+    return;
+  }
+  const live = S.editor.live;
+  if (live) {
+    live.next = next;
+    if (live.hist) showLive(live);
+    return;
+  }
+  // first move: render the picture without the live stages (and without the
+  // border, which is drawn as an outline), then filter it. It is rendered at
+  // the size the committed render will be, and its histogram read at full
+  // resolution: auto-levels clips 1% tails, and a downsized copy has
+  // averaged those tails away.
+  const fresh = S.editor.live = { hist: null, next };
+  const base = clone(curEdits());
+  for (const k of LIVE_KEYS) delete base[k];
+  delete base.border;
+  renderEditPreview(base, true, { onReady: () => {
+    if (!S.editor || S.editor.live !== fresh) return;
+    const px = sampleImageData(pane._img, 1e6);
+    if (!px) { S.editor.live = null; requestDraft(fresh.next); return; }
+    const h = channelHist(px);
+    fresh.hist = [h.r, h.g, h.b];
+    showLive(fresh);
+  } });
+}
+function showLive(live) {
+  const pane = panesEl.children[0];
+  if (!pane) return;
+  showLiveTone(pane._img, live.next, live.hist);
+  const b = live.next.border;
+  showLiveBorder(b && b.w ? +b.w : 0, b && b.color);
 }
 function sliderCommit(inp) {
-  sliderDragging = false;
-  clearTimeout(srvTimer);
+  draftNext = null;
+  if (S.editor) S.editor.live = null;
   // the slider may have been set programmatically (double-click reset), so the
   // numeric twin has to be re-synced here, not only while dragging
   const num = inp.parentElement.querySelector("input.num");
   if (num) num.value = parseFloat(inp.value).toFixed(2);
-  pushEdit(editsWith(inp, true));   // server bakes the real result; live filter stays until it loads
+  pushEdit(editsWith(inp, true));   // server bakes the real result; live layers stay until it loads
   inp.blur();    // release focus so arrow keys go back to navigation
 }
 
@@ -1986,21 +2358,24 @@ function enterCropMode() {
   $("cropBtn").classList.add("active");
   toast("Drag a box to crop · Esc cancels");
   // strip crop AND border: crop coords are normalized against the bare frame,
-  // so the overlay must be drawn on that same frame
-  const noCrop = clone(curEdits()); delete noCrop.crop; delete noCrop.border;
+  // so the overlay must be drawn on that same frame. The retouch strokes are
+  // positioned on the cropped frame, so they are mapped out into the whole
+  // one — left as they were, every heal showed up in the wrong place here.
+  const cur = curEdits();
+  const noCrop = clone(cur); delete noCrop.crop; delete noCrop.border;
+  const f = S.viewer._fit[0];
+  if (cur.spots && cur.spots.length && cur.crop && f) {
+    const [l, t, r, b] = cur.crop;
+    noCrop.spots = remapSpots(cur.spots, cur.crop, [0, 0, 1, 1],
+                              f.nw / Math.max(1e-6, r - l), f.nh / Math.max(1e-6, b - t));
+  }
   const pane = panesEl.children[0];
-  const img = pane._img;
-  const url = previewUrl(S.editor.path, noCrop);
-  const ready = () => {
-    computeFit(0, pane, img);
+  renderEditPreview(noCrop, false, { onReady: () => {
+    if (!S.cropMode) return;
     S.viewer.zoom = 1; S.viewer.panx = 0; S.viewer.pany = 0;
     applyTransform();
     buildCropOverlay(pane);
-  };
-  img.onload = ready;
-  // if the un-cropped frame is already what's displayed, onload won't fire
-  if (img.getAttribute("src") === url && img.complete && img.naturalWidth) ready();
-  else img.src = url;
+  } });
 }
 
 function exitCropMode(rerender = true) {
@@ -2085,8 +2460,13 @@ function buildCropOverlay(pane) {
 
 // Retouch spots are stored in the *cropped* frame, so re-cropping would slide
 // them off their blemishes. Map them through the old crop into the new one
-// instead of quietly throwing the retouch work away; spots that fall outside
-// the new frame are dropped because there is nothing left for them to fix.
+// instead of quietly throwing the retouch work away; strokes that no longer
+// touch the new frame are dropped because there is nothing left for them to
+// fix. `nw`/`nh` are the size of the uncropped frame (any scale).
+//
+// A brush stroke is a path plus a source offset; older spots are a point plus
+// an absolute source point. This used to map only the latter, so re-cropping
+// dropped every brush stroke.
 function remapSpots(spots, oldCrop, newCrop, nw, nh) {
   if (!spots || !spots.length) return spots;
   const o = oldCrop && oldCrop.length === 4 ? oldCrop : [0, 0, 1, 1];
@@ -2097,10 +2477,17 @@ function remapSpots(spots, oldCrop, newCrop, nw, nh) {
   const rk = Math.min(ow * nw, oh * nh) / Math.min(cw * nw, ch * nh);
   const mx = (x) => (o[0] + x * ow - newCrop[0]) / cw;
   const my = (y) => (o[1] + y * oh - newCrop[1]) / ch;
-  return spots
-    .map((s) => Object.assign({}, s, { x: mx(s.x), y: my(s.y),
-                                       sx: mx(s.sx), sy: my(s.sy), r: s.r * rk }))
-    .filter((s) => s.x > 0 && s.x < 1 && s.y > 0 && s.y < 1);
+  const round = (v) => Math.round(v * 1e5) / 1e5;
+  return spots.map((s) => {
+    const n = Object.assign({}, s, { r: s.r * rk });
+    if (s.pts) n.pts = s.pts.map((p) => [round(mx(p[0])), round(my(p[1]))]);
+    if (s.x != null) { n.x = mx(s.x); n.y = my(s.y); }
+    if (s.sx != null) { n.sx = mx(s.sx); n.sy = my(s.sy); }
+    if (s.dx != null) n.dx = s.dx * ow / cw;     // offsets are fractions of the frame
+    if (s.dy != null) n.dy = s.dy * oh / ch;
+    return n;
+  }).filter((s) => (s.pts || [[s.x, s.y]]).some((p) =>
+    p[0] > -s.r && p[0] < 1 + s.r && p[1] > -s.r && p[1] < 1 + s.r));
 }
 
 function cropAspectRatio() {
@@ -2327,6 +2714,7 @@ window.addEventListener("mouseup", async () => {
   paint = null;
   const f = S.viewer && S.viewer._fit[0];
   if (!f || !S.editor) return;
+  const path = S.editor.path;   // the source search is a round trip; you may move on meanwhile
   const short = Math.min(f.nw, f.nh);
 
   let dx, dy;
@@ -2340,7 +2728,9 @@ window.addEventListener("mouseup", async () => {
     }
   } else {
     const plan = await planPaint(p);
-    if (!S.editor) return;            // photo changed while we were asking
+    // photo changed while we were asking: the stroke belongs to the old one,
+    // and pushing it now would heal the same spot on a different picture
+    if (!S.editor || S.editor.path !== path) return;
     if (plan) {
       dx = plan.dx; dy = plan.dy;
     } else {
@@ -2353,7 +2743,11 @@ window.addEventListener("mouseup", async () => {
     }
   }
   const n = clone(curEdits());
-  n.spots = (n.spots || []).concat([{ pts: p.pts, r: p.r, dx, dy, mode: p.mode }]);
+  // five decimals is a twentieth of a pixel on a 6000px frame; the full float
+  // noise only made the stored stack (and every request carrying it) longer
+  const r5 = (v) => Math.round(v * 1e5) / 1e5;
+  n.spots = (n.spots || []).concat([{ pts: p.pts.map((q) => [r5(q[0]), r5(q[1])]),
+                                      r: r5(p.r), dx: r5(dx), dy: r5(dy), mode: p.mode }]);
   pushEdit(n);
 });
 
@@ -2535,7 +2929,7 @@ function cycleFilter() {
   S.filter = opts[i];
   $("filterSel").value = S.filter;
   applyFilter();
-  toast("Filter: " + S.filter);
+  toast("Filter: " + $("filterSel").selectedOptions[0].textContent);
 }
 
 // ---------------------------------------------------------------------------

@@ -67,6 +67,9 @@ def make_library():
     names = ["a.jpg", "b&'.jpg", "c.png", os.path.join("sub", "d.jpg")]
     for i, n in enumerate(names):
         Image.new("RGB", (300, 200), (40 * i % 255, 90, 160)).save(os.path.join(d, n))
+    # big enough that a crop has detail to lose
+    big = Image.effect_noise((3000, 2000), 40).convert("RGB")
+    big.save(os.path.join(d, "big.jpg"), quality=90)
     # a stand-in negative beside a.jpg: never decoded by the tests, only routed
     open(os.path.join(d, "a.cr2"), "wb").write(b"not really a raw")
     return d
@@ -81,7 +84,8 @@ def main():
 
     st, b = req("/api/open", {"folder": d, "recursive": True})
     photos = json.loads(b)["photos"]
-    check("open scans the folder recursively", st == 200 and len(photos) == 5, (st, b[:200]))
+    check("open scans the folder recursively", st == 200 and len(photos) == 6, (st, b[:200]))
+    check("every photo carries a render tag", all(p.get("tag") for p in photos), photos[:1])
     p0 = next(p["path"] for p in photos if p["path"].endswith("a.jpg"))
 
     st, b = req(q("/api/thumb", path=p0))
@@ -92,15 +96,50 @@ def main():
     st, b = req(q("/api/thumb", path=p0, full=1))
     check("thumb full=1 falls back on a non-RAW", st == 200 and b[:2] == b"\xff\xd8", st)
 
-    # A live editor preview is a fast draft off a downscaled base. It must not
-    # be reused as the committed render for the same edits — that would leave a
-    # cropped photo permanently soft.
     edits = {"bright": 1.4, "crop": [0.1, 0.1, 0.6, 0.6]}
     st, draft = req(q("/api/preview", path=p0, edits=json.dumps(edits)))
     check("live preview renders", st == 200 and draft[:2] == b"\xff\xd8", st)
     req("/api/edit", {"path": p0, "edits": edits})
-    st, stored = req(q("/api/preview", path=p0))
-    check("committed preview is not the draft", stored != draft, (len(draft), len(stored)))
+
+    # A crop keeps full detail in the preview: the base is decoded big enough
+    # for the cropped frame to still fill the preview size. And what the
+    # editor renders live is the very render the loupe is served later.
+    pb = os.path.join(d, "big.jpg")
+    crop = {"crop": [0.25, 0.25, 0.75, 0.75], "exposure": 0.3}
+    st, live = req("/api/render", {"path": pb, "edits": crop, "size": 2400})
+    check("POST /api/render renders", st == 200 and live[:2] == b"\xff\xd8", st)
+    import io as _io
+    check("a cropped preview keeps full detail",
+          Image.open(_io.BytesIO(live)).size == (1500, 1000), Image.open(_io.BytesIO(live)).size)
+    st, b = req("/api/edit", {"path": pb, "edits": crop})
+    tag = json.loads(b)["tag"]
+    st, stored = req(q("/api/preview", path=pb))
+    check("the committed preview is the live render", stored == live, (len(stored), len(live)))
+
+    # URLs that name their exact version are cached for good; others revalidate
+    mt = os.stat(pb).st_mtime
+    r = urllib.request.urlopen(BASE + q("/api/thumb", path=pb, t=tag, m=repr(mt)))
+    check("a versioned thumbnail URL is immutable",
+          "immutable" in r.headers.get("Cache-Control", ""), r.headers.get("Cache-Control"))
+    r = urllib.request.urlopen(BASE + q("/api/thumb", path=pb, t="stale", m=repr(mt)))
+    check("a stale thumbnail URL is revalidated",
+          r.headers.get("Cache-Control") == "no-cache", r.headers.get("Cache-Control"))
+
+    # a long retouch history does not fit in a URL; the POST path takes it
+    many = {"spots": [{"pts": [[0.3 + k * 1e-4, 0.3]] * 40, "r": 0.02, "dx": 0.1, "dy": 0}
+                      for k in range(60)]}
+    st, b = req("/api/render", {"path": p0, "edits": many, "size": 480})
+    check("a long retouch history renders", st == 200 and len(json.dumps(many)) > 30000, st)
+
+    # the grid's prefetch renders thumbnails in the background
+    pc = os.path.join(d, "sub", "d.jpg")
+    req("/api/prefetch", {"items": [[pc, 0]]})
+    target = A._cache_file(pc, os.stat(pc).st_mtime, str(A.THUMB_SIZE), "")
+    for _ in range(40):
+        if target.exists():
+            break
+        time.sleep(0.1)
+    check("prefetch renders thumbnails ahead of the grid", target.exists(), target)
 
     st, b = req(q("/api/meta", path=p0))
     check("meta reads dimensions", st == 200 and json.loads(b)["width"] == 300, b[:200])
@@ -148,6 +187,30 @@ def main():
     st, _ = req("/api/delete-rejected", {"confirm": False},
                 headers={"Origin": BASE})
     check("same-origin POST is allowed", st == 200, st)
+    # DNS rebinding: a hostile name pointed at 127.0.0.1 is same-origin with
+    # itself, but still names itself in the Host header
+    st, _ = req("/api/state", headers={"Host": "evil.example:{}".format(PORT)})
+    check("a foreign Host header is refused", st == 403, st)
+
+    # one request can mark several files (a RAW+JPEG pair, a compare verdict)
+    pa, pbb = os.path.join(d, "a.jpg"), os.path.join(d, "b&'.jpg")
+    req("/api/mark", {"paths": [pa, pbb], "rating": 4})
+    st, b = req("/api/state")
+    rated = {p["path"]: p["rating"] for p in json.loads(b)["photos"]}
+    check("batch mark rates every path", rated.get(pa) == 4 and rated.get(pbb) == 4, rated)
+
+    # with subfolders off, the subfolder's photos are out of the grid — and
+    # out of reach of export too
+    req("/api/open", {"folder": d, "recursive": False})
+    st, b = req("/api/state")
+    check("non-recursive state hides subfolder photos",
+          not any(os.sep + "sub" + os.sep in p["path"] for p in json.loads(b)["photos"]),
+          [p["path"] for p in json.loads(b)["photos"]])
+    out3 = os.path.join(WORK, "out_flat")
+    st, b = req("/api/export", {"dest": out3, "selection": "keep", "raw_copy": False})
+    check("non-recursive export skips hidden subfolder keepers",
+          not os.path.exists(os.path.join(out3, "d.jpg")), os.listdir(out3))
+    req("/api/open", {"folder": d, "recursive": True})
 
     # rows for files that vanished from disk are dropped on rescan
     os.remove(os.path.join(d, "c.png"))
@@ -156,11 +219,27 @@ def main():
     paths = [p["path"] for p in json.loads(b)["photos"]]
     check("deleted file is pruned from the DB",
           not any(p.endswith("c.png") for p in paths), paths)
-    check("the other photos survive the prune", len(paths) == 4, paths)
+    check("the other photos survive the prune", len(paths) == 5, paths)
 
     st, b = req("/api/save-copy", {"path": p0})
     check("save copy writes an edited JPEG next to the original",
           st == 200 and os.path.isfile(json.loads(b)["photo"]["path"]), (st, b[:200]))
+
+    # A RAW+JPEG pair is split into one date folder even when only the JPEG
+    # knows when it was taken and the RAW's file date is the next day.
+    d2 = os.path.join(WORK, "pairs")
+    os.makedirs(d2)
+    ex = Image.Exif()
+    ex[0x8769] = {36867: "2021:03:04 23:59:00"}
+    Image.new("RGB", (60, 40), "grey").save(os.path.join(d2, "x.jpg"), exif=ex.tobytes())
+    open(os.path.join(d2, "x.cr2"), "wb").write(b"not really a raw")
+    nextday = time.mktime((2021, 3, 5, 12, 0, 0, 0, 0, -1))
+    os.utime(os.path.join(d2, "x.cr2"), (nextday, nextday))
+    req("/api/open", {"folder": d2, "recursive": True})
+    st, b = req("/api/split-by-date", {"granularity": "day", "source": "taken", "action": "move"})
+    check("date split keeps a RAW+JPEG pair together",
+          st == 200 and sorted(os.listdir(os.path.join(d2, "2021-03-04"))) == ["x.cr2", "x.jpg"],
+          (st, b[:200], os.listdir(d2)))
 
     server.should_exit = True
     time.sleep(0.4)
